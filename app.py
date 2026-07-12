@@ -23,27 +23,29 @@ async def process_image(file: UploadFile = File(...)):
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-        # 1. הקטנת התמונה אם היא גדולה מדי (מניעת קריסת שרת מוחלטת)
+        # 1. הקטנת התמונה למניעת קריסה (שומר על ביצועים מהירים)
         max_width = 1200
         height, width = img.shape[:2]
         if width > max_width:
             scaling_factor = max_width / float(width)
             img = cv2.resize(img, None, fx=scaling_factor, fy=scaling_factor, interpolation=cv2.INTER_AREA)
 
-        # 2. המרה לשחור לבן
+        # 2. המרה לאפור והגברת קונטרסט (מתיחת היסטוגרמה) - מציל את הטקסט על הרקע הירוק
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
 
-        # 3. טשטוש גאוסיאני (Gaussian Blur) - קריטי! מעלים את הפיקסלים של המסך המצולם
+        # 3. טשטוש גאוסיאני עדין נגד ריצודי מסך המחשב
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        # 4. חיתוך סף קלאסי (Otsu's) - מנקה את הרקע הלבן והצבעוני ומשאיר טקסט שחור בלבד
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # 4. חיתוך סף אדפטיבי - קריטי לטבלאות עם תאים צבעוניים!
+        thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15)
 
-        # 5. קריאת הטקסט מחדש כבלוקים מסודרים
-        custom_config = r'-l heb+eng --psm 6'
+        # 5. הגדרות Tesseract
+        # psm 4 - מניח שהטקסט מסודר כעמודה אחת של טקסט בגדלים משתנים
+        custom_config = r'-l heb+eng --psm 4'
         extracted_text = pytesseract.image_to_string(thresh, config=custom_config)
 
-        # ניקוי שורות ריקות או רעשי רקע קטנים
+        # ניקוי שורות ריקות או רעשי רקע זעירים
         lines = [line.strip() for line in extracted_text.split('\n') if len(line.strip()) > 2]
 
         return JSONResponse(content={"status": "success", "data": lines})
