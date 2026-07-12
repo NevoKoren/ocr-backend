@@ -19,22 +19,24 @@ app.add_middleware(
 @app.post("/upload/")
 async def process_image(file: UploadFile = File(...)):
     try:
-        # קריאת קובץ התמונה שנשלח מהדפדפן
         contents = await file.read()
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-        # עיבוד תמונה בסיסי (OpenCV) לשיפור איכות הקריאה
+        # 1. הגדלת התמונה פי 2 (קריטי לצילומי מסך)
+        img = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+        
+        # 2. המרה לאפור
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        # הפיכה לשחור לבן חד
-        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+        
+        # 3. סף אדפטיבי - עוזר להתעלם מרעשי רקע ולהבליט טקסט
+        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
 
-        # הפעלת Tesseract עם תמיכה בעברית ואנגלית
-        # psm 6 אומר למנוע להתייחס לטקסט כבלוק אחיד של נתונים
-        custom_config = r'-l heb+eng --psm 6'
+        # 4. שימוש ב-PSM 11 שאומר לטסרקט: "חפש טקסט מפוזר, אל תנסה למצוא פסקאות"
+        custom_config = r'-l heb+eng --psm 11'
         extracted_text = pytesseract.image_to_string(thresh, config=custom_config)
 
-        # חלוקת הטקסט לשורות לטובת הצגה קלה באתר
+        # ניקוי שורות ריקות לחלוטין
         lines = [line.strip() for line in extracted_text.split('\n') if line.strip()]
 
         return JSONResponse(content={"status": "success", "data": lines})
