@@ -1,53 +1,64 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import pytesseract
-import cv2
-import numpy as np
+import requests
 
 app = FastAPI()
 
-# אישור קבלת בקשות מהאתר שלך (CORS)
+# אישור קבלת בקשות מכל מקור (CORS) כולל האתר שלך ב-Firebase
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # בהמשך תוכל לשנות לכתובת ה-Firebase המדויקת שלך
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# מפתח ברירת המחדל לבדיקות. מומלץ להחליף במפתח חינמי אישי מהאתר שלהם
+OCR_SPACE_API_KEY = "helloworld" 
+
+@app.get("/")
+def read_root():
+    return {"status": "healthy", "message": "OCR.space Proxy Server is running"}
+
 @app.post("/upload/")
 async def process_image(file: UploadFile = File(...)):
     try:
-        contents = await file.read()
-        nparr = np.frombuffer(contents, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-        # 1. הקטנת התמונה למניעת קריסה (שומר על ביצועים מהירים)
-        max_width = 1200
-        height, width = img.shape[:2]
-        if width > max_width:
-            scaling_factor = max_width / float(width)
-            img = cv2.resize(img, None, fx=scaling_factor, fy=scaling_factor, interpolation=cv2.INTER_AREA)
-
-        # 2. המרה לאפור והגברת קונטרסט (מתיחת היסטוגרמה) - מציל את הטקסט על הרקע הירוק
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-
-        # 3. טשטוש גאוסיאני עדין נגד ריצודי מסך המחשב
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-
-        # 4. חיתוך סף אדפטיבי - קריטי לטבלאות עם תאים צבעוניים!
-        thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15)
-
-        # 5. הגדרות Tesseract
-        # psm 4 - מניח שהטקסט מסודר כעמודה אחת של טקסט בגדלים משתנים
-        custom_config = r'-l heb+eng --psm 4'
-        extracted_text = pytesseract.image_to_string(thresh, config=custom_config)
-
-        # ניקוי שורות ריקות או רעשי רקע זעירים
-        lines = [line.strip() for line in extracted_text.split('\n') if len(line.strip()) > 2]
-
+        # קריאת קובץ התמונה שנשלח מהדפדפן
+        file_bytes = await file.read()
+        
+        # הגדרת הפרמטרים עבור ה-API של OCR.space
+        payload = {
+            "apikey": OCR_SPACE_API_KEY,
+            "language": "heb",      # הגדרת שפה: עברית
+            "isTable": "true",      # הפעלת מנוע זיהוי המבנה הטבלאי
+            "scale": "true"         # שיפור רזולוציה אוטומטי לצילומי מסך/טלפון
+        }
+        
+        # הכנת הקובץ למשלוח בפורמט Multipart
+        files = [
+            ('file', (file.filename, file_bytes, file.content_type))
+        ]
+        
+        # ביצוע בקשת ה-POST לשרת ה-OCR המרוחק
+        response = requests.post("https://api.ocr.space/parse/image", data=payload, files=files)
+        result_json = response.json()
+        
+        # בדיקה אם השרת המרוחק החזיר שגיאת עיבוד
+        if result_json.get("IsErroredOnProcessing"):
+            error_msg = result_json.get("ErrorMessage", ["שגיאה לא ידועה בשרת ה-OCR"])[0]
+            return JSONResponse(content={"status": "error", "message": error_msg}, status_code=400)
+        
+        # חילוץ תוצאות הטקסט
+        parsed_results = result_json.get("ParsedResults", [])
+        if not parsed_results:
+            return JSONResponse(content={"status": "success", "data": []})
+            
+        extracted_text = parsed_results[0].get("ParsedText", "")
+        
+        # פירוק לשורות וניקוי רווחים מיותרים
+        lines = [line.strip() for line in extracted_text.split('\n') if line.strip()]
+        
         return JSONResponse(content={"status": "success", "data": lines})
 
     except Exception as e:
