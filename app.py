@@ -30,7 +30,7 @@ async def process_image(file: UploadFile = File(...)):
         # הגדרת הפרמטרים עבור ה-API של OCR.space
         payload = {
             "apikey": OCR_SPACE_API_KEY,
-            "language": "heb",      # הגדרת שפה: עברית
+            "OCREngine": "3",       # חובה: שימוש במנוע המתקדם שתומך בעברית ובטבלאות
             "isTable": "true",      # הפעלת מנוע זיהוי המבנה הטבלאי
             "scale": "true"         # שיפור רזולוציה אוטומטי לצילומי מסך/טלפון
         }
