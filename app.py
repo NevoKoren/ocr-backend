@@ -14,7 +14,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-OCR_SPACE_API_KEY = "helloworld"  # זכור להחליף במפתח החינמי האישי שלך
+OCR_SPACE_API_KEY = "helloworld"  # זכור להחליף במפתח שלך
 
 phone_pattern = re.compile(r'\b(05\d[- ]?\d{7}|0[23489][- ]?\d{7})\b')
 date_pattern = re.compile(r'\b(\d{1,2}[/\.-]\d{1,2}[/\.-]\d{2,4})\b')
@@ -22,7 +22,7 @@ time_pattern = re.compile(r'\b(\d{1,2}:\d{2})\b')
 
 @app.get("/")
 def read_root():
-    return {"status": "healthy", "message": "Debuggable OCR Server is running"}
+    return {"status": "healthy", "message": "Pipe-Splitting OCR Server is running"}
 
 @app.post("/upload/")
 async def process_image(file: UploadFile = File(...)):
@@ -53,15 +53,19 @@ async def process_image(file: UploadFile = File(...)):
         lines = [line.strip() for line in extracted_text.split('\n') if line.strip()]
         
         structured_data = []
-        debug_lines = []  # מערך שישמור את חומר הגלם לדיבאג
+        debug_lines = []
         name_index = -1
         is_header_found = False
         
         for line_idx, line in enumerate(lines):
-            # פירוק השורה לתאים לפי טאבים או רווחים כפולות
-            cells = [cell.strip() for cell in re.split(r'\t|\s{2,}', line)]
+            # דילוג על שורת המקפים של טבלת Markdown שמנוע ה-OCR מייצר (למשל |---|---|)
+            if re.match(r'^[\s\|\-]+$', line):
+                continue
+                
+            # התיקון הקריטי: פיצול השורה לעמודות לפי התו '|' או לפי טאב
+            cells = [cell.strip() for cell in re.split(r'\||\t', line)]
             
-            # איתור שורת הכותרות
+            # שלב איתור שורת הכותרות
             if not is_header_found:
                 for idx, cell in enumerate(cells):
                     if "שם" in cell or "מועמד" in cell:
@@ -79,12 +83,15 @@ async def process_image(file: UploadFile = File(...)):
                     "cells_detected": cells,
                     "name_index_found": name_index
                 })
+                
                 if is_header_found:
                     continue
             
-            # חילוץ נתונים
+            # שלב חילוץ הנתונים משורות המידע
+            # כאן המערכת תיקח נטו את התא הספציפי שבו אמור להיות השם
             raw_name = cells[name_index] if (name_index != -1 and name_index < len(cells)) else ""
             
+            # הטלפון והזמנים מחולצים מהשורה כולה בעזרת תבניות מספרים
             phone_match = phone_pattern.search(line)
             date_match = date_pattern.search(line)
             time_match = time_pattern.search(line)
@@ -93,11 +100,11 @@ async def process_image(file: UploadFile = File(...)):
             date = date_match.group(1) if date_match else ""
             time = time_match.group(1) if time_match else ""
             
-            # ניקוי השם
+            # ניקוי השם מאותיות באנגלית, מספרים וסימנים
             clean_name = re.sub(r'[^\u0590-\u05fe\s]', '', raw_name).strip()
             clean_name = " ".join(clean_name.split())
             
-            # שמירת נתוני הדיבאג הספציפיים לשורה זו
+            # שמירת הדיבאג לבקרה
             debug_lines.append({
                 "line_number": line_idx + 1,
                 "action": "data_extraction",
@@ -118,7 +125,6 @@ async def process_image(file: UploadFile = File(...)):
                     "time": time if time else "-"
                 })
         
-        # החזרת התוצאות יחד עם אובייקט הדיבאג
         return JSONResponse(content={
             "status": "success",
             "data": structured_data,
