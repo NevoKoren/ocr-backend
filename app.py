@@ -2,10 +2,11 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import requests
+import re
 
 app = FastAPI()
 
-# אישור קבלת בקשות מכל מקור (CORS) כולל האתר שלך ב-Firebase
+# אישור קבלת בקשות מכל מקור (CORS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,52 +15,87 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# מפתח ברירת המחדל לבדיקות. מומלץ להחליף במפתח חינמי אישי מהאתר שלהם
-OCR_SPACE_API_KEY = "helloworld" 
+OCR_SPACE_API_KEY = "helloworld"  # מומלץ להחליף במפתח החינמי האישי שלך
+
+# הגדרת תבניות Regex לזיהוי נתונים
+phone_pattern = re.compile(r'\b(05\d[- ]?\d{7}|0[23489][- ]?\d{7})\b')
+date_pattern = re.compile(r'\b(\d{1,2}[/\.-]\d{1,2}[/\.-]\d{2,4})\b')
+time_pattern = re.compile(r'\b(\d{1,2}:\d{2})\b')
+id_pattern = re.compile(r'\b\d{9}\b')  # לזיהוי וסינון תעודות זהות/מספרים אישיים
 
 @app.get("/")
 def read_root():
-    return {"status": "healthy", "message": "OCR.space Proxy Server is running"}
+    return {"status": "healthy", "message": "Structured OCR Server is running"}
 
 @app.post("/upload/")
 async def process_image(file: UploadFile = File(...)):
     try:
-        # קריאת קובץ התמונה שנשלח מהדפדפן
         file_bytes = await file.read()
         
-        # הגדרת הפרמטרים עבור ה-API של OCR.space
         payload = {
             "apikey": OCR_SPACE_API_KEY,
-            "OCREngine": "3",       # חובה: שימוש במנוע המתקדם שתומך בעברית ובטבלאות
-            "isTable": "true",      # הפעלת מנוע זיהוי המבנה הטבלאי
-            "scale": "true"         # שיפור רזולוציה אוטומטי לצילומי מסך/טלפון
+            "OCREngine": "3",
+            "isTable": "true",
+            "scale": "true"
         }
         
-        # הכנת הקובץ למשלוח בפורמט Multipart
-        files = [
-            ('file', (file.filename, file_bytes, file.content_type))
-        ]
+        files = [('file', (file.filename, file_bytes, file.content_type))]
         
-        # ביצוע בקשת ה-POST לשרת ה-OCR המרוחק
         response = requests.post("https://api.ocr.space/parse/image", data=payload, files=files)
         result_json = response.json()
         
-        # בדיקה אם השרת המרוחק החזיר שגיאת עיבוד
         if result_json.get("IsErroredOnProcessing"):
-            error_msg = result_json.get("ErrorMessage", ["שגיאה לא ידועה בשרת ה-OCR"])[0]
+            error_msg = result_json.get("ErrorMessage", ["שגיאה בעיבוד ה-OCR"])[0]
             return JSONResponse(content={"status": "error", "message": error_msg}, status_code=400)
         
-        # חילוץ תוצאות הטקסט
         parsed_results = result_json.get("ParsedResults", [])
         if not parsed_results:
             return JSONResponse(content={"status": "success", "data": []})
             
         extracted_text = parsed_results[0].get("ParsedText", "")
-        
-        # פירוק לשורות וניקוי רווחים מיותרים
         lines = [line.strip() for line in extracted_text.split('\n') if line.strip()]
         
-        return JSONResponse(content={"status": "success", "data": lines})
+        structured_data = []
+        
+        for line in lines:
+            # 1. חיפוש וחילוץ נתונים מבוססי תבנית
+            phone_match = phone_pattern.search(line)
+            date_match = date_pattern.search(line)
+            time_match = time_pattern.search(line)
+            id_match = id_pattern.search(line)
+            
+            phone = phone_match.group(1) if phone_match else ""
+            date = date_match.group(1) if date_match else ""
+            time = time_match.group(1) if time_match else ""
+            
+            # 2. ניקוי השורה מכל הנתונים שחולצו כדי לבודד את השם
+            clean_line = line
+            if phone_match: clean_line = clean_line.replace(phone_match.group(0), "")
+            if date_match: clean_line = clean_line.replace(date_match.group(0), "")
+            if time_match: clean_line = clean_line.replace(time_match.group(0), "")
+            if id_match: clean_line = clean_line.replace(id_match.group(0), "")
+            
+            # 3. הסרת סימני טבלה (כמו |, -, _) וכל מה שאינו אותיות בעברית או רווחים
+            clean_line = re.sub(r'[^\u0590-\u05fe\s]', '', clean_line)
+            
+            # ניקוי רווחים כפולים
+            name_words = clean_line.split()
+            name = " ".join(name_words)
+            
+            # סינון שורות כותרת של האקסל (למשל שורה שמכילה את המילה "שם" או "טלפון" ככותרת)
+            if name in ["שם", "מספר טלפון", "תאריך", "שעה", "תז", "מספר אישי"]:
+                continue
+                
+            # הוספה למערך רק אם נמצא מידע מינימלי בשורה
+            if name or phone or date or time:
+                structured_data.append({
+                    "name": name.strip(),
+                    "phone": phone.strip(),
+                    "date": date.strip(),
+                    "time": time.strip()
+                })
+        
+        return JSONResponse(content={"status": "success", "data": structured_data})
 
     except Exception as e:
         return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
