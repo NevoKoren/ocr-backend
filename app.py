@@ -6,7 +6,6 @@ import re
 
 app = FastAPI()
 
-# אישור קבלת בקשות מכל מקור (CORS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,15 +16,22 @@ app.add_middleware(
 
 OCR_SPACE_API_KEY = "helloworld"  # מומלץ להחליף במפתח החינמי האישי שלך
 
-# הגדרת תבניות Regex לזיהוי נתונים
+# תבניות Regex לזיהוי נתונים
 phone_pattern = re.compile(r'\b(05\d[- ]?\d{7}|0[23489][- ]?\d{7})\b')
 date_pattern = re.compile(r'\b(\d{1,2}[/\.-]\d{1,2}[/\.-]\d{2,4})\b')
 time_pattern = re.compile(r'\b(\d{1,2}:\d{2})\b')
-id_pattern = re.compile(r'\b\d{9}\b')  # לזיהוי וסינון תעודות זהות/מספרים אישיים
+id_pattern = re.compile(r'\b\d{9}\b')
+
+# רשימת מילים לסינון מוחלט (תפקידים, סטטוסים וסוגי שירות) כדי שלא ייכנסו לשם המועמד
+excluded_keywords = [
+    "לוחם", "סדיר", "קבע", "מילואים", "תומך", "לחימה", 
+    "גובניק", "ג'ובניק", "קצין", "מפקד", "חייל", "שירות", "תפקיד",
+    "ג'וב", "מועמד", "מיועד", "מיושב", "סיווג"
+]
 
 @app.get("/")
 def read_root():
-    return {"status": "healthy", "message": "Structured OCR Server is running"}
+    return {"status": "healthy", "message": "Advanced Structured OCR Server is running"}
 
 @app.post("/upload/")
 async def process_image(file: UploadFile = File(...)):
@@ -58,7 +64,6 @@ async def process_image(file: UploadFile = File(...)):
         structured_data = []
         
         for line in lines:
-            # 1. חיפוש וחילוץ נתונים מבוססי תבנית
             phone_match = phone_pattern.search(line)
             date_match = date_pattern.search(line)
             time_match = time_pattern.search(line)
@@ -68,25 +73,29 @@ async def process_image(file: UploadFile = File(...)):
             date = date_match.group(1) if date_match else ""
             time = time_match.group(1) if time_match else ""
             
-            # 2. ניקוי השורה מכל הנתונים שחולצו כדי לבודד את השם
+            # ניקוי השורה מנתונים מבוססי תבנית
             clean_line = line
             if phone_match: clean_line = clean_line.replace(phone_match.group(0), "")
             if date_match: clean_line = clean_line.replace(date_match.group(0), "")
             if time_match: clean_line = clean_line.replace(time_match.group(0), "")
             if id_match: clean_line = clean_line.replace(id_match.group(0), "")
             
-            # 3. הסרת סימני טבלה (כמו |, -, _) וכל מה שאינו אותיות בעברית או רווחים
+            # הסרת מילים המשתייכות לתפקיד או סוג שירות מתוך השורה
+            for word in excluded_keywords:
+                clean_line = re.sub(r'\b' + re.escape(word) + r'\b', '', clean_line)
+                # תמיכה גם בהסרה אם המילה צמודה לאות יחס (כמו "בלוחם", "כסדיר")
+                clean_line = re.sub(r'\b[בכלהמ]?' + re.escape(word) + r'\b', '', clean_line)
+            
+            # השארת אותיות בעברית ורווחים בלבד לטובת בידוד השם הנקי
             clean_line = re.sub(r'[^\u0590-\u05fe\s]', '', clean_line)
             
-            # ניקוי רווחים כפולים
             name_words = clean_line.split()
             name = " ".join(name_words)
             
-            # סינון שורות כותרת של האקסל (למשל שורה שמכילה את המילה "שם" או "טלפון" ככותרת)
-            if name in ["שם", "מספר טלפון", "תאריך", "שעה", "תז", "מספר אישי"]:
+            # דילוג על שורות כותרת פוטנציאליות של אקסל
+            if name in ["שם", "מספר טלפון", "תאריך", "שעה", "תז", "מספר אישי", "תפקיד", "סוג שירות"]:
                 continue
                 
-            # הוספה למערך רק אם נמצא מידע מינימלי בשורה
             if name or phone or date or time:
                 structured_data.append({
                     "name": name.strip(),
