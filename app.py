@@ -48,8 +48,11 @@ async def process_image(file: UploadFile = File(...)):
         
         parsed_results = result_json.get("ParsedResults", [])
         if not parsed_results:
-            return JSONResponse(content={"status": "success", "data": [], "debug": {"message": "No text found"}})
+            return JSONResponse(content={"status": "success", "data": [], "debug": {"raw_ocr_output": "", "detected_name_index": -1, "lines_processing": []}})
             
+        # הוספתי בחזרה את שליפת הטקסט הגולמי עבור מערכת הדיבאג של האתר שלך
+        extracted_text = parsed_results[0].get("ParsedText", "")
+        
         # חילוץ קואורדינטות המילים
         overlay = parsed_results[0].get("TextOverlay", {})
         lines_data = overlay.get("Lines", [])
@@ -190,10 +193,12 @@ async def process_image(file: UploadFile = File(...)):
                     "time": time if time else "-"
                 })
         
+        # החזרתי את השדה raw_ocr_output הנדרש
         return JSONResponse(content={
             "status": "success",
             "data": structured_data,
             "debug": {
+                "raw_ocr_output": extracted_text,
                 "detected_name_index": name_index,
                 "lines_processing": debug_lines
             }
