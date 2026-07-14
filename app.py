@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import requests
 import re
+import cv2
+import numpy as np
 
 app = FastAPI()
 
@@ -16,13 +18,12 @@ app.add_middleware(
 
 OCR_SPACE_API_KEY = "helloworld"  # החלף במפתח ה-API האישי שלך
 
-# תבניות Regex לזיהוי מספרים ונתונים מובנים
 phone_pattern = re.compile(r'(05\d[ \-\.]?\d{7}|0[23489][ \-\.]?\d{7})')
 date_pattern = re.compile(r'(\d{1,2}[/\.-]\d{1,2}[/\.-]\d{2,4})')
 time_pattern = re.compile(r'(\d{1,2}:\d{2})')
 id_pattern = re.compile(r'(\d{9})')
 
-# רשימת מילים שחורות - אם תא מכיל את אחת המילים האלו, הוא בטוח לא עמודת השם!
+# רשימת הגיבוי: מסננת תפקידים אם ה-OCR מפספס עמודה בגלל לכלוך
 excluded_keywords = [
     "לוחם", "סדיר", "קבע", "מילואים", "תומך", "לחימה", "חיל", "הים", "אוויר", 
     "יבשה", "סגל", "מיועד", "סטטוס", "דרגה", "תפקיד", "סיווג", "שירות", "מתשחקר", 
@@ -31,21 +32,34 @@ excluded_keywords = [
 
 @app.get("/")
 def read_root():
-    return {"status": "healthy", "message": "Bulletproof Column-Filtering OCR Server is running"}
+    return {"status": "healthy", "message": "Vision-Enhanced Column OCR Server"}
 
 @app.post("/upload/")
 async def process_image(file: UploadFile = File(...)):
     try:
+        # 1. קריאת התמונה והמרה למערך של OpenCV
         file_bytes = await file.read()
+        nparr = np.frombuffer(file_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
+        # 2. פילטר נטרול צבעים (מעלים פסים ירוקים, סגולים והשתקפויות מסך)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced_img = clahe.apply(gray)
+        
+        # קידוד מחדש לזיכרון כדי לשלוח ל-API
+        _, img_encoded = cv2.imencode('.jpg', enhanced_img)
+        processed_bytes = img_encoded.tobytes()
+        
+        # 3. שליחה לפענוח במצב טבלה
         payload = {
             "apikey": OCR_SPACE_API_KEY,
             "OCREngine": "3",
-            "isTable": "true",  # מחזיר את מבנה הצינורות (|) כדי לשמור על השורות מחוברות
+            "isTable": "true",
             "scale": "true"
         }
         
-        files = [('file', (file.filename, file_bytes, file.content_type))]
+        files = [('file', (file.filename, processed_bytes, 'image/jpeg'))]
         response = requests.post("https://api.ocr.space/parse/image", data=payload, files=files)
         result_json = response.json()
         
@@ -66,14 +80,11 @@ async def process_image(file: UploadFile = File(...)):
         is_header_found = False
         
         for line_idx, line in enumerate(lines):
-            # דילוג על שורות המקפים של טבלת ה-Markdown
             if re.match(r'^[\s\|\-]+$', line):
                 continue
                 
-            # פיצול לפי צינורות, תוך שמירה על תאים ריקים כדי למנוע תזוזת אינדקסים!
             cells = [cell.strip() for cell in line.split('|')]
             
-            # שלב א': זיהוי עמודת השם לפי שורת הכותרות
             if not is_header_found:
                 for idx, cell in enumerate(cells):
                     if any(k in cell for k in ["שם", "מועמד"]):
@@ -94,23 +105,19 @@ async def process_image(file: UploadFile = File(...)):
                 if is_header_found:
                     continue
             
-            # שלב ב': שליפת השם מהעמודה הספציפית
             raw_name = ""
             if name_index != -1 and name_index < len(cells):
                 raw_name = cells[name_index]
             
-            # מנגנון הגיבוי והסינון הדו-שלבי:
-            # אם התא שנבחר ריק, או שהוא מכיל מספרים, או שהוא קצר מדי - נבצע סריקה חכמה
+            # סריקת גיבוי חכמה (למקרה שהמנוע פספס עמודה למרות ניקוי התמונה)
             clean_check = re.sub(r'[^\u0590-\u05fe]', '', raw_name).strip()
             if not raw_name or len(clean_check) < 2 or any(kw in raw_name for kw in excluded_keywords):
                 for cell in cells:
                     cell_clean = re.sub(r'[^\u0590-\u05fe\s]', '', cell).strip()
-                    # אם התא מכיל לפחות 2 אותיות בעברית והוא לא מכיל אף מילת תפקיד/יחידה/סטטוס
                     if len(cell_clean) >= 2 and not any(kw in cell_clean for kw in excluded_keywords):
                         raw_name = cell
                         break
             
-            # שליפת טלפון, תאריך ושעה מכל השורה
             phone_match = phone_pattern.search(line)
             date_match = date_pattern.search(line)
             time_match = time_pattern.search(line)
@@ -121,7 +128,6 @@ async def process_image(file: UploadFile = File(...)):
             time = time_match.group(1) if time_match else ""
             id_num = id_match.group(1) if id_match else ""
             
-            # ניקוי השם הסופי
             clean_name = raw_name
             if phone: clean_name = clean_name.replace(phone, "")
             if date: clean_name = clean_name.replace(date, "")
@@ -141,7 +147,6 @@ async def process_image(file: UploadFile = File(...)):
                 "phone_found": phone
             })
             
-            # הכנסה רק אם יש שם תקין ונתון מזהה (טלפון או ת"ז) כדי לסנן רעשי ממשק אקסל
             if len(clean_name) >= 2 and (phone or id_num):
                 structured_data.append({
                     "name": clean_name,
