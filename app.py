@@ -14,40 +14,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-OCR_SPACE_API_KEY = "helloworld"  # החלף במפתח שלך
+OCR_SPACE_API_KEY = "helloworld"  # החלף במפתח ה-API שלך
 
 phone_pattern = re.compile(r'(05\d[ \-\.]?\d{7}|0[23489][ \-\.]?\d{7})')
 date_pattern = re.compile(r'(\d{1,2}[/\.-]\d{1,2}[/\.-]\d{2,4})')
 time_pattern = re.compile(r'(\d{1,2}:\d{2})')
 id_pattern = re.compile(r'(\d{9})')
 
-# רשימת הגיבוי: מסננת תפקידים בבטחה. 
+# מילות סינון למקרה של סטיות קלות בפיקסלים
 excluded_keywords = [
     "לוחם", "סדיר", "קבע", "מילואים", "תומך", "לחימה", "חיל", "הים", "אוויר", 
     "יבשה", "סגל", "מיועד", "סטטוס", "דרגה", "תפקיד", "סיווג", "שירות", "מתשחקר", 
     "המתשחקר", "המתתחקר", "מיל", "חובה", "גברים", "נשים", "ימי", "כללי", "מלשב", 'מלש"ב', "ל.ר", "לר"
 ]
 
-def remove_excluded_words(text):
-    """מוחק מילות תפקיד רק אם הן מילים שלמות (כדי לא להרוס שמות כמו 'אלירן')"""
-    words = text.split()
-    safe_words = [w for w in words if w not in excluded_keywords]
-    return " ".join(safe_words)
-
 @app.get("/")
 def read_root():
-    return {"status": "healthy", "message": "Pure Python Column-Shift OCR Server"}
+    return {"status": "healthy", "message": "Spatial Anchor OCR Server is running"}
 
 @app.post("/upload/")
 async def process_image(file: UploadFile = File(...)):
     try:
-        # חזרנו לשליחה הישירה והבטוחה ללא OpenCV שעשה בעיות קידוד
         file_bytes = await file.read()
         
         payload = {
             "apikey": OCR_SPACE_API_KEY,
             "OCREngine": "3",
-            "isTable": "true",
+            "isOverlayRequired": "true",  # קריטי: מביא קואורדינטות X,Y לכל מילה
+            "isTable": "false",           # לא צריכים את המנוע שלו, אנחנו בונים טבלה מתמטית
             "scale": "true"
         }
         
@@ -56,108 +50,137 @@ async def process_image(file: UploadFile = File(...)):
         result_json = response.json()
         
         if result_json.get("IsErroredOnProcessing"):
-            error_msg = result_json.get("ErrorMessage", ["שגיאה בעיבוד ה-OCR"])[0]
-            return JSONResponse(content={"status": "error", "message": error_msg}, status_code=400)
+            return JSONResponse(content={"status": "error", "message": "שגיאה בעיבוד ה-OCR"}, status_code=400)
         
         parsed_results = result_json.get("ParsedResults", [])
         if not parsed_results:
-            return JSONResponse(content={"status": "success", "data": [], "debug": {"raw_ocr_output": "", "detected_name_index": -1, "lines_processing": []}})
+            return JSONResponse(content={"status": "success", "data": []})
             
-        extracted_text = parsed_results[0].get("ParsedText", "")
-        lines = [line.strip() for line in extracted_text.split('\n') if line.strip()]
+        overlay = parsed_results[0].get("TextOverlay", {})
+        lines_data = overlay.get("Lines", [])
         
+        # 1. איסוף כל המילים ומיקומן הפיזי
+        words = []
+        for line in lines_data:
+            for word in line.get("Words", []):
+                left = word.get("Left", 0)
+                width = word.get("Width", 0)
+                words.append({
+                    "text": word.get("WordText", ""),
+                    "top": word.get("Top", 0),
+                    "left": left,
+                    "width": width,
+                    "height": word.get("Height", 0),
+                    "right": left + width,
+                    "center_x": left + (width / 2),
+                    "center_y": word.get("Top", 0) + (word.get("Height", 0) / 2)
+                })
+        
+        if not words:
+            return JSONResponse(content={"status": "success", "data": []})
+            
+        # 2. מציאת ה"עוגן" של עמודת השם (היכן היא ממוקמת על ציר ה-X)
+        name_col_center_x = None
+        for w in words:
+            if "שם" in w['text'] or "מועמד" in w['text'] or "פרטי" in w['text']:
+                name_col_center_x = w['center_x']
+                break
+                
+        # 3. קיבוץ המילים לשורות אופקיות לפי ציר Y
+        words.sort(key=lambda w: w['center_y'])
+        rows = []
+        current_row = []
+        # חישוב גובה ממוצע כדי לדעת מה הסטייה המותרת לשורה
+        median_height = sorted([w['height'] for w in words])[len(words)//2] if words else 20
+        y_tolerance = median_height * 0.7  
+        
+        for w in words:
+            if not current_row:
+                current_row.append(w)
+            else:
+                row_center_y = sum(x['center_y'] for x in current_row) / len(current_row)
+                if abs(w['center_y'] - row_center_y) <= y_tolerance:
+                    current_row.append(w)
+                else:
+                    rows.append(current_row)
+                    current_row = [w]
+        if current_row:
+            rows.append(current_row)
+            
         structured_data = []
-        debug_lines = []
-        name_index = -1
-        is_header_found = False
         
-        for line_idx, line in enumerate(lines):
-            if re.match(r'^[\s\|\-]+$', line):
+        # 4. ניתוח חכם של כל שורה
+        for row in rows:
+            # מיון השורה מימין לשמאל (כמו בעברית)
+            row.sort(key=lambda w: w['left'], reverse=True)
+            
+            # חיבור השורה לטקסט מלא כדי לבדוק אם יש כאן "עוגן" (טלפון)
+            row_full_text = " ".join([w['text'] for w in row])
+            phone_match = phone_pattern.search(row_full_text)
+            
+            # אם אין טלפון בשורה הזו בגובה הזה - מדלגים. זה מסנן את כל ה"רעש".
+            if not phone_match:
                 continue
                 
-            cells = [cell.strip() for cell in line.split('|')]
+            phone = phone_match.group(1)
+            date = date_pattern.search(row_full_text).group(1) if date_pattern.search(row_full_text) else ""
+            time = time_pattern.search(row_full_text).group(1) if time_pattern.search(row_full_text) else ""
             
-            if not is_header_found:
-                for idx, cell in enumerate(cells):
-                    if any(k in cell for k in ["שם", "מועמד"]):
-                        name_index = idx
-                        is_header_found = True
-                        break
+            # 5. חיתוך השורה לתאים לפי המרחק (רווחים פיזיים גדולים בין מילים)
+            cells = []
+            current_cell = []
+            for i, word in enumerate(row):
+                if not current_cell:
+                    current_cell.append(word)
+                else:
+                    prev_word = row[i-1]
+                    # המרחק בין המילה הימנית (הקודמת) למילה השמאלית (הנוכחית)
+                    gap = prev_word['left'] - word['right']
+                    gap_threshold = max(word['height'] * 1.2, 20)
+                    
+                    if gap > gap_threshold: # רווח גדול = עמודה חדשה
+                        cells.append(current_cell)
+                        current_cell = [word]
+                    else:
+                        current_cell.append(word)
+            if current_cell:
+                cells.append(current_cell)
                 
-                if "טלפון" in line or "תאריך" in line or "אישי" in line:
-                    is_header_found = True
-                
-                debug_lines.append({
-                    "line_number": line_idx + 1,
-                    "action": "header_check",
-                    "raw_line": line,
-                    "cells_detected": cells,
-                    "name_index_found": name_index
-                })
-                if is_header_found:
-                    continue
-            
-            phone_match = phone_pattern.search(line)
-            date_match = date_pattern.search(line)
-            time_match = time_pattern.search(line)
-            id_match = id_pattern.search(line)
-            
-            phone = phone_match.group(1) if phone_match else ""
-            date = date_match.group(1) if date_match else ""
-            time = time_match.group(1) if time_match else ""
-            id_num = id_match.group(1) if id_match else ""
-            
-            raw_name = ""
-            if name_index != -1 and name_index < len(cells):
-                raw_name = cells[name_index]
-            
-            # שלב 1: מסננים את השם מהעמודה שנבחרה
-            candidate_name = remove_excluded_words(raw_name)
-            candidate_name = re.sub(r'[^\u0590-\u05fe\s]', '', candidate_name).strip()
-            
-            # שלב 2 (הסוד לפסים הירוקים): אם העמודה זזה וקיבלנו רק תפקיד (כמו 'ל.ר'), העמודה תישאר ריקה. 
-            # אם היא ריקה, נסרוק את כל שאר התאים ונשלוף את השם מהתא שהתפספס!
-            if len(candidate_name) < 2:
+            # 6. מציאת התא ששייך לעמודת השם!
+            best_name_text = ""
+            if name_col_center_x is not None:
+                # מחפשים את התא שהמרכז שלו הכי קרוב למרכז של כותרת "שם מלא"
+                min_dist = float('inf')
                 for cell in cells:
-                    temp_cell = cell
-                    if phone: temp_cell = temp_cell.replace(phone, "")
-                    if id_num: temp_cell = temp_cell.replace(id_num, "")
-                    
-                    temp_cell = remove_excluded_words(temp_cell)
-                    temp_cell = re.sub(r'[^\u0590-\u05fe\s]', '', temp_cell).strip()
-                    temp_cell = " ".join(temp_cell.split())
-                    
-                    if len(temp_cell) >= 2:
-                        candidate_name = temp_cell
+                    cell_center_x = sum(w['center_x'] for w in cell) / len(cell)
+                    dist = abs(cell_center_x - name_col_center_x)
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_name_text = " ".join([w['text'] for w in cell])
+            else:
+                # גיבוי: אם לא מצאנו כותרת, ניקח את התא הראשון מימין שיש בו אותיות בעברית
+                for cell in cells:
+                    text = " ".join([w['text'] for w in cell])
+                    if len(re.sub(r'[^\u0590-\u05fe]', '', text)) >= 2:
+                        best_name_text = text
                         break
             
-            clean_name = candidate_name
+            # ניקוי סופי של התא שנבחר
+            best_name_text = best_name_text.replace(phone, "").strip()
+            words_in_name = best_name_text.split()
+            safe_words = [w for w in words_in_name if w not in excluded_keywords]
+            clean_name = " ".join(safe_words)
+            clean_name = re.sub(r'[^\u0590-\u05fe\s]', '', clean_name).strip()
             
-            debug_lines.append({
-                "line_number": line_idx + 1,
-                "action": "data_extraction",
-                "raw_line": line,
-                "cells_detected": cells,
-                "cleaned_name": clean_name
-            })
-            
-            if len(clean_name) >= 2 and (phone or id_num):
+            if len(clean_name) >= 2:
                 structured_data.append({
                     "name": clean_name,
-                    "phone": phone if phone else "-",
-                    "date": date if date else "-",
-                    "time": time if time else "-"
+                    "phone": phone,
+                    "date": date,
+                    "time": time
                 })
         
-        return JSONResponse(content={
-            "status": "success",
-            "data": structured_data,
-            "debug": {
-                "raw_ocr_output": extracted_text,
-                "detected_name_index": name_index,
-                "lines_processing": debug_lines
-            }
-        })
+        return JSONResponse(content={"status": "success", "data": structured_data})
 
     except Exception as e:
         return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
