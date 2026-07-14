@@ -3,8 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import requests
 import re
-import cv2
-import numpy as np
 
 app = FastAPI()
 
@@ -16,42 +14,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-OCR_SPACE_API_KEY = "helloworld"  # החלף במפתח ה-API האישי שלך
+OCR_SPACE_API_KEY = "helloworld"  # החלף במפתח שלך
 
 phone_pattern = re.compile(r'(05\d[ \-\.]?\d{7}|0[23489][ \-\.]?\d{7})')
 date_pattern = re.compile(r'(\d{1,2}[/\.-]\d{1,2}[/\.-]\d{2,4})')
 time_pattern = re.compile(r'(\d{1,2}:\d{2})')
 id_pattern = re.compile(r'(\d{9})')
 
-# רשימת הגיבוי: מסננת תפקידים אם ה-OCR מפספס עמודה בגלל לכלוך
+# רשימת הגיבוי: מסננת תפקידים בבטחה. 
 excluded_keywords = [
     "לוחם", "סדיר", "קבע", "מילואים", "תומך", "לחימה", "חיל", "הים", "אוויר", 
     "יבשה", "סגל", "מיועד", "סטטוס", "דרגה", "תפקיד", "סיווג", "שירות", "מתשחקר", 
-    "המתשחקר", "המתתחקר", "מיל", "חובה", "גברים", "נשים", "ימי", "כללי", "מלשב", "מלש\"ב"
+    "המתשחקר", "המתתחקר", "מיל", "חובה", "גברים", "נשים", "ימי", "כללי", "מלשב", 'מלש"ב', "ל.ר", "לר"
 ]
+
+def remove_excluded_words(text):
+    """מוחק מילות תפקיד רק אם הן מילים שלמות (כדי לא להרוס שמות כמו 'אלירן')"""
+    words = text.split()
+    safe_words = [w for w in words if w not in excluded_keywords]
+    return " ".join(safe_words)
 
 @app.get("/")
 def read_root():
-    return {"status": "healthy", "message": "Vision-Enhanced Column OCR Server"}
+    return {"status": "healthy", "message": "Pure Python Column-Shift OCR Server"}
 
 @app.post("/upload/")
 async def process_image(file: UploadFile = File(...)):
     try:
-        # 1. קריאת התמונה והמרה למערך של OpenCV
+        # חזרנו לשליחה הישירה והבטוחה ללא OpenCV שעשה בעיות קידוד
         file_bytes = await file.read()
-        nparr = np.frombuffer(file_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
-        # 2. פילטר נטרול צבעים (מעלים פסים ירוקים, סגולים והשתקפויות מסך)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        enhanced_img = clahe.apply(gray)
-        
-        # קידוד מחדש לזיכרון כדי לשלוח ל-API
-        _, img_encoded = cv2.imencode('.jpg', enhanced_img)
-        processed_bytes = img_encoded.tobytes()
-        
-        # 3. שליחה לפענוח במצב טבלה
         payload = {
             "apikey": OCR_SPACE_API_KEY,
             "OCREngine": "3",
@@ -59,7 +51,7 @@ async def process_image(file: UploadFile = File(...)):
             "scale": "true"
         }
         
-        files = [('file', (file.filename, processed_bytes, 'image/jpeg'))]
+        files = [('file', (file.filename, file_bytes, file.content_type))]
         response = requests.post("https://api.ocr.space/parse/image", data=payload, files=files)
         result_json = response.json()
         
@@ -105,19 +97,6 @@ async def process_image(file: UploadFile = File(...)):
                 if is_header_found:
                     continue
             
-            raw_name = ""
-            if name_index != -1 and name_index < len(cells):
-                raw_name = cells[name_index]
-            
-            # סריקת גיבוי חכמה (למקרה שהמנוע פספס עמודה למרות ניקוי התמונה)
-            clean_check = re.sub(r'[^\u0590-\u05fe]', '', raw_name).strip()
-            if not raw_name or len(clean_check) < 2 or any(kw in raw_name for kw in excluded_keywords):
-                for cell in cells:
-                    cell_clean = re.sub(r'[^\u0590-\u05fe\s]', '', cell).strip()
-                    if len(cell_clean) >= 2 and not any(kw in cell_clean for kw in excluded_keywords):
-                        raw_name = cell
-                        break
-            
             phone_match = phone_pattern.search(line)
             date_match = date_pattern.search(line)
             time_match = time_pattern.search(line)
@@ -128,23 +107,38 @@ async def process_image(file: UploadFile = File(...)):
             time = time_match.group(1) if time_match else ""
             id_num = id_match.group(1) if id_match else ""
             
-            clean_name = raw_name
-            if phone: clean_name = clean_name.replace(phone, "")
-            if date: clean_name = clean_name.replace(date, "")
-            if time: clean_name = clean_name.replace(time, "")
-            if id_num: clean_name = clean_name.replace(id_num, "")
+            raw_name = ""
+            if name_index != -1 and name_index < len(cells):
+                raw_name = cells[name_index]
             
-            clean_name = re.sub(r'[^\u0590-\u05fe\s]', '', clean_name).strip()
-            clean_name = " ".join(clean_name.split())
+            # שלב 1: מסננים את השם מהעמודה שנבחרה
+            candidate_name = remove_excluded_words(raw_name)
+            candidate_name = re.sub(r'[^\u0590-\u05fe\s]', '', candidate_name).strip()
+            
+            # שלב 2 (הסוד לפסים הירוקים): אם העמודה זזה וקיבלנו רק תפקיד (כמו 'ל.ר'), העמודה תישאר ריקה. 
+            # אם היא ריקה, נסרוק את כל שאר התאים ונשלוף את השם מהתא שהתפספס!
+            if len(candidate_name) < 2:
+                for cell in cells:
+                    temp_cell = cell
+                    if phone: temp_cell = temp_cell.replace(phone, "")
+                    if id_num: temp_cell = temp_cell.replace(id_num, "")
+                    
+                    temp_cell = remove_excluded_words(temp_cell)
+                    temp_cell = re.sub(r'[^\u0590-\u05fe\s]', '', temp_cell).strip()
+                    temp_cell = " ".join(temp_cell.split())
+                    
+                    if len(temp_cell) >= 2:
+                        candidate_name = temp_cell
+                        break
+            
+            clean_name = candidate_name
             
             debug_lines.append({
                 "line_number": line_idx + 1,
                 "action": "data_extraction",
                 "raw_line": line,
                 "cells_detected": cells,
-                "selected_name_cell": raw_name,
-                "cleaned_name": clean_name,
-                "phone_found": phone
+                "cleaned_name": clean_name
             })
             
             if len(clean_name) >= 2 and (phone or id_num):
