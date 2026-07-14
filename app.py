@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import requests
 import re
+import cv2
+import numpy as np
 
 app = FastAPI()
 
@@ -23,14 +25,82 @@ phone_pattern = re.compile(r'\b(05\d[- ]?\d{7}|0[23489][- ]?\d{7})\b')
 date_pattern = re.compile(r'\b(\d{1,2}[/\.-]\d{1,2}[/\.-]\d{2,4})\b')
 time_pattern = re.compile(r'\b(\d{1,2}:\d{2})\b')
 
+def crop_table(img):
+    """
+    פונקציה מתקדמת מבוססת OpenCV לזיהוי ובידוד רשת האקסל (Table Grid).
+    מזהה קווים אופקיים ואנכיים כדי לחתוך החוצה את כפתורי האקסל, עמודות האותיות (A-P) ומספרי השורות.
+    """
+    try:
+        # המרה לגווני אפור
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # סף אדפטיבי להתמודדות עם הבדלי תאורה (צילום מסך פיזי מהטלפון)
+        thresh = cv2.adaptiveThreshold(
+            ~gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, 
+            cv2.THRESH_BINARY, 15, -2
+        )
+        
+        # בידוד קווים אופקיים
+        cols = thresh.shape[1]
+        horizontal_size = cols // 40
+        horizontal_struct = cv2.getStructuringElement(cv2.MORPH_RECT, (horizontal_size, 1))
+        horizontal = cv2.erode(thresh, horizontal_struct)
+        horizontal = cv2.dilate(horizontal, horizontal_struct)
+        
+        # בידוד קווים אנכיים
+        rows = thresh.shape[0]
+        vertical_size = rows // 40
+        vertical_struct = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vertical_size))
+        vertical = cv2.erode(thresh, vertical_struct)
+        vertical = cv2.dilate(vertical, vertical_struct)
+        
+        # שילוב הקווים ליצירת רשת הטבלה בלבד
+        grid_mask = cv2.add(horizontal, vertical)
+        
+        # מציאת קווי מתאר של הרשת
+        contours, _ = cv2.findContours(grid_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return img
+            
+        # מציאת המלבן הגדול ביותר (רשת האקסל המרכזית)
+        largest_contour = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(largest_contour)
+        
+        # הוספת שולי ביטחון קלים (Padding) כדי לא לחתוך שורות קצה
+        padding = 15
+        ny = max(0, y - padding)
+        nx = max(0, x - padding)
+        nh = min(img.shape[0] - ny, h + 2 * padding)
+        nw = min(img.shape[1] - nx, w + 2 * padding)
+        
+        # החזרה של התמונה החתוכה רק אם המלבן הגדול מספיק משמעותי
+        if nw > cols // 3 and nh > rows // 3:
+            return img[ny:ny+nh, nx:nx+nw]
+            
+        return img
+    except Exception as e:
+        print(f"Error in table cropping: {e}")
+        return img
+
 @app.get("/")
 def read_root():
-    return {"status": "healthy", "message": "Pipe-Splitting OCR Server is running"}
+    return {"status": "healthy", "message": "Morphological Table-Cropping OCR Server is running"}
 
 @app.post("/upload/")
 async def process_image(file: UploadFile = File(...)):
     try:
+        # קריאת הקובץ והמרה למטריצה של OpenCV
         file_bytes = await file.read()
+        nparr = np.frombuffer(file_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        # 1. הפעלת מנגנון החיתוך האוטומטי (Auto-Crop) להסרת ה"רעש" מסביב
+        cropped_img = crop_table(img)
+        
+        # 2. קידוד התמונה החתוכה בחזרה לבייטים עבור ה-API
+        _, img_encoded = cv2.imencode('.jpg', cropped_img)
+        processed_bytes = img_encoded.tobytes()
         
         # פרמטרים אופטימליים עבור OCR.space Engine 3
         payload = {
@@ -40,7 +110,7 @@ async def process_image(file: UploadFile = File(...)):
             "scale": "true"
         }
         
-        files = [('file', (file.filename, file_bytes, file.content_type))]
+        files = [('file', (file.filename, processed_bytes, 'image/jpeg'))]
         
         # שליחת הבקשה לשרת ה-OCR
         response = requests.post("https://api.ocr.space/parse/image", data=payload, files=files)
@@ -65,7 +135,7 @@ async def process_image(file: UploadFile = File(...)):
         
         for line_idx, line in enumerate(lines):
             # דילוג על שורות המקפים והפרדות של טבלת Markdown (למשל |---|---|)
-            if re.match(r'^[\s\|\-]+$', line):
+            if re.match(r'^[\s\|-]+$', line):
                 continue
                 
             # פיצול השורה לעמודות על פי התו '|' או טאבים
