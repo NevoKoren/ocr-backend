@@ -161,7 +161,16 @@ async def process_image(file: UploadFile = File(...)):
                     "time": time
                 })
         
-        return JSONResponse(content={"status": "success", "data": structured_data})
+        # החזרת התשובה כולל דוח הדיבאג כדי שנראה בדיוק מה Tesseract קרא
+        return JSONResponse(content={
+            "status": "success",
+            "data": structured_data,
+            "debug": {
+                "total_words_found": len(words),
+                "name_col_center_x": name_col_center_x,
+                "all_words": [w['text'] for w in words]
+            }
+        })
 
     except Exception as e:
         return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
