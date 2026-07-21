@@ -29,28 +29,24 @@ excluded_keywords = [
 
 @app.get("/")
 def read_root():
-    return {"status": "healthy", "message": "Local Tesseract Spatial OCR Server is running"}
+    return {"status": "healthy", "message": "Docker Tesseract OCR Server is running"}
 
 @app.post("/upload/")
 async def process_image(file: UploadFile = File(...)):
     try:
-        # 1. קריאת התמונה ועיבוד מקדים קל בעזרת OpenCV
         file_bytes = await file.read()
         nparr = np.frombuffer(file_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
-        # המרה לגווני אפור משפרת משמעותית את הדיוק של Tesseract
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
-        # 2. הרצת Tesseract מקומית! 
-        # משתמשים ב-PSM 6 (הנחת בלוק טקסט אחיד) שמתאים לאלגוריתם המרחבי שלנו
+        # הרצת Tesseract המקומי בקונטיינר
         d = pytesseract.image_to_data(gray, lang='heb+eng', config='--psm 6', output_type=Output.DICT)
         
-        # 3. חילוץ המילים וקואורדינטות ה-X,Y מתוך המבנה של Tesseract
         words = []
         n_boxes = len(d['text'])
         for i in range(n_boxes):
-            if int(d['conf'][i]) > 15:  # מתעלמים מ"רעש" שהמנוע לא בטוח לגביו
+            if int(d['conf'][i]) > 15:
                 text = d['text'][i].strip()
                 if text:
                     left = d['left'][i]
@@ -71,14 +67,12 @@ async def process_image(file: UploadFile = File(...)):
         if not words:
             return JSONResponse(content={"status": "success", "data": []})
             
-        # 4. מציאת ה"עוגן" של עמודת השם (היכן היא ממוקמת על ציר ה-X)
         name_col_center_x = None
         for w in words:
             if "שם" in w['text'] or "מועמד" in w['text'] or "פרטי" in w['text']:
                 name_col_center_x = w['center_x']
                 break
                 
-        # 5. קיבוץ המילים לשורות אופקיות לפי ציר Y (מוגן מזוויות צילום בזכות ה-Tolerance)
         words.sort(key=lambda w: w['center_y'])
         rows = []
         current_row = []
@@ -101,15 +95,11 @@ async def process_image(file: UploadFile = File(...)):
             
         structured_data = []
         
-        # 6. ניתוח חכם של כל שורה
         for row in rows:
-            # מיון השורה מימין לשמאל
             row.sort(key=lambda w: w['left'], reverse=True)
-            
             row_full_text = " ".join([w['text'] for w in row])
             phone_match = phone_pattern.search(row_full_text)
             
-            # עוגן טלפון: אם אין טלפון בשורה בגובה הזה - מדלגים.
             if not phone_match:
                 continue
                 
@@ -117,7 +107,6 @@ async def process_image(file: UploadFile = File(...)):
             date = date_pattern.search(row_full_text).group(1) if date_pattern.search(row_full_text) else ""
             time = time_pattern.search(row_full_text).group(1) if time_pattern.search(row_full_text) else ""
             
-            # חיתוך השורה לתאים לפי המרחק בין המילים
             cells = []
             current_cell = []
             for i, word in enumerate(row):
@@ -136,7 +125,6 @@ async def process_image(file: UploadFile = File(...)):
             if current_cell:
                 cells.append(current_cell)
                 
-            # מציאת התא ששייך לעמודת השם לפי ה-X
             best_name_text = ""
             if name_col_center_x is not None:
                 min_dist = float('inf')
@@ -153,7 +141,6 @@ async def process_image(file: UploadFile = File(...)):
                         best_name_text = text
                         break
             
-            # ניקוי סופי של התא שנבחר
             best_name_text = best_name_text.replace(phone, "").strip()
             words_in_name = best_name_text.split()
             safe_words = [w for w in words_in_name if w not in excluded_keywords]
