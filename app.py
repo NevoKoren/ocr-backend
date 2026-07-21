@@ -29,12 +29,11 @@ excluded_keywords = [
 
 @app.get("/")
 def read_root():
-    return {"status": "healthy", "message": "Docker Tesseract OCR Server with Enhanced Vision"}
+    return {"status": "healthy", "message": "Tesseract Server with Morphological Line Removal"}
 
 @app.post("/upload/")
 async def process_image(file: UploadFile = File(...)):
     try:
-        # 1. קריאת התמונה הגולמית לזיכרון
         file_bytes = await file.read()
         nparr = np.frombuffer(file_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -43,39 +42,56 @@ async def process_image(file: UploadFile = File(...)):
             return JSONResponse(content={"status": "error", "message": "קובץ התמונה פגום או לא קריא"}, status_code=400)
             
         # ==========================================================
-        # צינור עיבוד התמונה (משקפיים ל-Tesseract)
+        # הגישה הנכונה: מחיקת הטבלה כדי ש-Tesseract יקרא רק טקסט
         # ==========================================================
         
-        # א. הגדלה פי 2 כדי ש-Tesseract יזהה תווים קטנים בבירור
-        img_scaled = cv2.resize(img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        # 1. המרה לאפור והגדלה לתפיסת פרטים
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
         
-        # ב. המרה לגווני אפור
-        gray = cv2.cvtColor(img_scaled, cv2.COLOR_BGR2GRAY)
+        # 2. טשטוש קל כדי להעלים את הפיקסלים של צילום המסך (Moiré)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
         
-        # ג. בינאריזציה אדפטיבית - מחיקת רקעים, צבעים, פסים ירוקים וצללים מהמסך
-        # משאיר אך ורק פיקסלים שחורים טהורים (טקסט) על רקע לבן טהור
-        binary_img = cv2.adaptiveThreshold(
-            gray, 255, 
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 
-            31, 15
-        )
+        # 3. בינאריזציה הפוכה: הטקסט והקווים הופכים ללבן (255) והרקע לשחור (0)
+        # זה חובה כדי שנוכל לבצע פעולות מורפולוגיות כדי למצוא קווים
+        thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 15)
         
+        # 4. מחיקת קווים אנכיים (קירות העמודות של אקסל)
+        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
+        remove_vertical = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
+        cnts_v, _ = cv2.findContours(remove_vertical, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts_v:
+            cv2.drawContours(thresh, [c], -1, (0, 0, 0), 5) # צובע את הקו בשחור כדי להעלים אותו
+            
+        # 5. מחיקת קווים אופקיים (רצפת השורות של אקסל)
+        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+        remove_horizontal = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
+        cnts_h, _ = cv2.findContours(remove_horizontal, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts_h:
+            cv2.drawContours(thresh, [c], -1, (0, 0, 0), 5)
+            
+        # 6. היפוך חזרה: הטקסט נשאר שחור טהור על רקע לבן טהור (ללא טבלאות!)
+        clean_img = 255 - thresh
+        
+        # טשטוש מדיאני קל כדי להחליק את השוליים של האותיות אחרי המחיקות
+        clean_img = cv2.medianBlur(clean_img, 3)
+
         # ==========================================================
         
-        # 2. הרצת Tesseract על התמונה הנקייה (binary_img)
+        # הרצת Tesseract. 
+        # משתמשים ב-PSM 6 שאומר ל-Tesseract: "זה בלוק טקסט אחיד, תקרא אותו משמאל לימין"
         try:
-            d = pytesseract.image_to_data(binary_img, lang='heb+eng', config='--psm 6', output_type=Output.DICT)
+            d = pytesseract.image_to_data(clean_img, lang='heb+eng', config='--psm 6', output_type=Output.DICT)
         except Exception as tesseract_err:
             return JSONResponse(content={"status": "error", "message": f"שגיאת מנוע OCR מקומי: {str(tesseract_err)}"}, status_code=500)
         
-        # 3. חילוץ המילים
         words = []
         n_boxes = len(d['text'])
         for i in range(n_boxes):
-            if int(d['conf'][i]) > 15:
+            if int(d['conf'][i]) > 15:  # סינון מילים ברמת ודאות נמוכה (רעשים קטנים שנשארו)
                 text = d['text'][i].strip()
-                if text:
+                # מסנן גם תווים בודדים כמו נקודות או פסיקים שהמנוע ממציא מהלכלוך
+                if text and len(text) > 1 or text.isdigit():
                     left = d['left'][i]
                     top = d['top'][i]
                     width = d['width'][i]
@@ -95,17 +111,15 @@ async def process_image(file: UploadFile = File(...)):
             return JSONResponse(content={
                 "status": "success", 
                 "data": [], 
-                "debug": {"total_words_found": 0, "message": "לא נמצא טקסט קריא לאחר עיבוד התמונה"}
+                "debug": {"total_words_found": 0, "message": "לא זוהה טקסט לאחר ניקוי הקווים"}
             })
             
-        # 4. מציאת ציר ה-X של עמודת השם
         name_col_center_x = None
         for w in words:
             if "שם" in w['text'] or "מועמד" in w['text'] or "פרטי" in w['text']:
                 name_col_center_x = w['center_x']
                 break
                 
-        # 5. קיבוץ המילים לשורות לפי ציר Y
         words.sort(key=lambda w: w['center_y'])
         rows = []
         current_row = []
@@ -128,7 +142,6 @@ async def process_image(file: UploadFile = File(...)):
             
         structured_data = []
         
-        # 6. הצלבה (חיפוש עוגן - מספרי טלפון)
         for row in rows:
             row.sort(key=lambda w: w['left'], reverse=True)
             row_full_text = " ".join([w['text'] for w in row])
@@ -141,7 +154,6 @@ async def process_image(file: UploadFile = File(...)):
             date = date_pattern.search(row_full_text).group(1) if date_pattern.search(row_full_text) else ""
             time = time_pattern.search(row_full_text).group(1) if time_pattern.search(row_full_text) else ""
             
-            # חלוקה לתאים
             cells = []
             current_cell = []
             for i, word in enumerate(row):
@@ -150,7 +162,7 @@ async def process_image(file: UploadFile = File(...)):
                 else:
                     prev_word = row[i-1]
                     gap = prev_word['left'] - word['right']
-                    gap_threshold = max(word['height'] * 1.2, 20)
+                    gap_threshold = max(word['height'] * 1.5, 25) # הגדלתי את מרווח התאים כי אין יותר קווי טבלה
                     
                     if gap > gap_threshold: 
                         cells.append(current_cell)
@@ -160,7 +172,6 @@ async def process_image(file: UploadFile = File(...)):
             if current_cell:
                 cells.append(current_cell)
                 
-            # שליפת התא המתאים ביותר (קרוב לעמודת השם)
             best_name_text = ""
             if name_col_center_x is not None:
                 min_dist = float('inf')
@@ -177,7 +188,6 @@ async def process_image(file: UploadFile = File(...)):
                         best_name_text = text
                         break
             
-            # ניקוי הטקסט וסינון תפקידים רגישים
             best_name_text = best_name_text.replace(phone, "").strip()
             words_in_name = best_name_text.split()
             safe_words = [w for w in words_in_name if w not in excluded_keywords]
@@ -192,7 +202,6 @@ async def process_image(file: UploadFile = File(...)):
                     "time": time
                 })
         
-        # מחזירים גם את נתוני הדיבאג לאתר
         return JSONResponse(content={
             "status": "success",
             "data": structured_data,
