@@ -29,11 +29,12 @@ excluded_keywords = [
 
 @app.get("/")
 def read_root():
-    return {"status": "healthy", "message": "Docker Tesseract OCR Server is running"}
+    return {"status": "healthy", "message": "Docker Tesseract OCR Server with Enhanced Vision"}
 
 @app.post("/upload/")
 async def process_image(file: UploadFile = File(...)):
     try:
+        # 1. קריאת התמונה הגולמית לזיכרון
         file_bytes = await file.read()
         nparr = np.frombuffer(file_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -41,14 +42,34 @@ async def process_image(file: UploadFile = File(...)):
         if img is None:
             return JSONResponse(content={"status": "error", "message": "קובץ התמונה פגום או לא קריא"}, status_code=400)
             
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # ==========================================================
+        # צינור עיבוד התמונה (משקפיים ל-Tesseract)
+        # ==========================================================
         
-        # הרצת Tesseract המקומי
+        # א. הגדלה פי 2 כדי ש-Tesseract יזהה תווים קטנים בבירור
+        img_scaled = cv2.resize(img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        
+        # ב. המרה לגווני אפור
+        gray = cv2.cvtColor(img_scaled, cv2.COLOR_BGR2GRAY)
+        
+        # ג. בינאריזציה אדפטיבית - מחיקת רקעים, צבעים, פסים ירוקים וצללים מהמסך
+        # משאיר אך ורק פיקסלים שחורים טהורים (טקסט) על רקע לבן טהור
+        binary_img = cv2.adaptiveThreshold(
+            gray, 255, 
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 
+            31, 15
+        )
+        
+        # ==========================================================
+        
+        # 2. הרצת Tesseract על התמונה הנקייה (binary_img)
         try:
-            d = pytesseract.image_to_data(gray, lang='heb+eng', config='--psm 6', output_type=Output.DICT)
+            d = pytesseract.image_to_data(binary_img, lang='heb+eng', config='--psm 6', output_type=Output.DICT)
         except Exception as tesseract_err:
             return JSONResponse(content={"status": "error", "message": f"שגיאת מנוע OCR מקומי: {str(tesseract_err)}"}, status_code=500)
         
+        # 3. חילוץ המילים
         words = []
         n_boxes = len(d['text'])
         for i in range(n_boxes):
@@ -71,14 +92,20 @@ async def process_image(file: UploadFile = File(...)):
                     })
         
         if not words:
-            return JSONResponse(content={"status": "success", "data": []})
+            return JSONResponse(content={
+                "status": "success", 
+                "data": [], 
+                "debug": {"total_words_found": 0, "message": "לא נמצא טקסט קריא לאחר עיבוד התמונה"}
+            })
             
+        # 4. מציאת ציר ה-X של עמודת השם
         name_col_center_x = None
         for w in words:
             if "שם" in w['text'] or "מועמד" in w['text'] or "פרטי" in w['text']:
                 name_col_center_x = w['center_x']
                 break
                 
+        # 5. קיבוץ המילים לשורות לפי ציר Y
         words.sort(key=lambda w: w['center_y'])
         rows = []
         current_row = []
@@ -101,6 +128,7 @@ async def process_image(file: UploadFile = File(...)):
             
         structured_data = []
         
+        # 6. הצלבה (חיפוש עוגן - מספרי טלפון)
         for row in rows:
             row.sort(key=lambda w: w['left'], reverse=True)
             row_full_text = " ".join([w['text'] for w in row])
@@ -113,6 +141,7 @@ async def process_image(file: UploadFile = File(...)):
             date = date_pattern.search(row_full_text).group(1) if date_pattern.search(row_full_text) else ""
             time = time_pattern.search(row_full_text).group(1) if time_pattern.search(row_full_text) else ""
             
+            # חלוקה לתאים
             cells = []
             current_cell = []
             for i, word in enumerate(row):
@@ -131,6 +160,7 @@ async def process_image(file: UploadFile = File(...)):
             if current_cell:
                 cells.append(current_cell)
                 
+            # שליפת התא המתאים ביותר (קרוב לעמודת השם)
             best_name_text = ""
             if name_col_center_x is not None:
                 min_dist = float('inf')
@@ -147,6 +177,7 @@ async def process_image(file: UploadFile = File(...)):
                         best_name_text = text
                         break
             
+            # ניקוי הטקסט וסינון תפקידים רגישים
             best_name_text = best_name_text.replace(phone, "").strip()
             words_in_name = best_name_text.split()
             safe_words = [w for w in words_in_name if w not in excluded_keywords]
@@ -161,7 +192,7 @@ async def process_image(file: UploadFile = File(...)):
                     "time": time
                 })
         
-        # החזרת התשובה כולל דוח הדיבאג כדי שנראה בדיוק מה Tesseract קרא
+        # מחזירים גם את נתוני הדיבאג לאתר
         return JSONResponse(content={
             "status": "success",
             "data": structured_data,
