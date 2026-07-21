@@ -1,7 +1,10 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import requests
+import pytesseract
+from pytesseract import Output
+import cv2
+import numpy as np
 import re
 
 app = FastAPI()
@@ -14,14 +17,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-OCR_SPACE_API_KEY = "helloworld"  # החלף במפתח ה-API שלך
-
 phone_pattern = re.compile(r'(05\d[ \-\.]?\d{7}|0[23489][ \-\.]?\d{7})')
 date_pattern = re.compile(r'(\d{1,2}[/\.-]\d{1,2}[/\.-]\d{2,4})')
 time_pattern = re.compile(r'(\d{1,2}:\d{2})')
-id_pattern = re.compile(r'(\d{9})')
 
-# מילות סינון למקרה של סטיות קלות בפיקסלים
 excluded_keywords = [
     "לוחם", "סדיר", "קבע", "מילואים", "תומך", "לחימה", "חיל", "הים", "אוויר", 
     "יבשה", "סגל", "מיועד", "סטטוס", "דרגה", "תפקיד", "סיווג", "שירות", "מתשחקר", 
@@ -30,68 +29,61 @@ excluded_keywords = [
 
 @app.get("/")
 def read_root():
-    return {"status": "healthy", "message": "Spatial Anchor OCR Server is running"}
+    return {"status": "healthy", "message": "Local Tesseract Spatial OCR Server is running"}
 
 @app.post("/upload/")
 async def process_image(file: UploadFile = File(...)):
     try:
+        # 1. קריאת התמונה ועיבוד מקדים קל בעזרת OpenCV
         file_bytes = await file.read()
+        nparr = np.frombuffer(file_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
-        payload = {
-            "apikey": OCR_SPACE_API_KEY,
-            "OCREngine": "3",
-            "isOverlayRequired": "true",  # קריטי: מביא קואורדינטות X,Y לכל מילה
-            "isTable": "false",           # לא צריכים את המנוע שלו, אנחנו בונים טבלה מתמטית
-            "scale": "true"
-        }
+        # המרה לגווני אפור משפרת משמעותית את הדיוק של Tesseract
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
-        files = [('file', (file.filename, file_bytes, file.content_type))]
-        response = requests.post("https://api.ocr.space/parse/image", data=payload, files=files)
-        result_json = response.json()
+        # 2. הרצת Tesseract מקומית! 
+        # משתמשים ב-PSM 6 (הנחת בלוק טקסט אחיד) שמתאים לאלגוריתם המרחבי שלנו
+        d = pytesseract.image_to_data(gray, lang='heb+eng', config='--psm 6', output_type=Output.DICT)
         
-        if result_json.get("IsErroredOnProcessing"):
-            return JSONResponse(content={"status": "error", "message": "שגיאה בעיבוד ה-OCR"}, status_code=400)
-        
-        parsed_results = result_json.get("ParsedResults", [])
-        if not parsed_results:
-            return JSONResponse(content={"status": "success", "data": []})
-            
-        overlay = parsed_results[0].get("TextOverlay", {})
-        lines_data = overlay.get("Lines", [])
-        
-        # 1. איסוף כל המילים ומיקומן הפיזי
+        # 3. חילוץ המילים וקואורדינטות ה-X,Y מתוך המבנה של Tesseract
         words = []
-        for line in lines_data:
-            for word in line.get("Words", []):
-                left = word.get("Left", 0)
-                width = word.get("Width", 0)
-                words.append({
-                    "text": word.get("WordText", ""),
-                    "top": word.get("Top", 0),
-                    "left": left,
-                    "width": width,
-                    "height": word.get("Height", 0),
-                    "right": left + width,
-                    "center_x": left + (width / 2),
-                    "center_y": word.get("Top", 0) + (word.get("Height", 0) / 2)
-                })
+        n_boxes = len(d['text'])
+        for i in range(n_boxes):
+            if int(d['conf'][i]) > 15:  # מתעלמים מ"רעש" שהמנוע לא בטוח לגביו
+                text = d['text'][i].strip()
+                if text:
+                    left = d['left'][i]
+                    top = d['top'][i]
+                    width = d['width'][i]
+                    height = d['height'][i]
+                    words.append({
+                        "text": text,
+                        "top": top,
+                        "left": left,
+                        "width": width,
+                        "height": height,
+                        "right": left + width,
+                        "center_x": left + (width / 2),
+                        "center_y": top + (height / 2)
+                    })
         
         if not words:
             return JSONResponse(content={"status": "success", "data": []})
             
-        # 2. מציאת ה"עוגן" של עמודת השם (היכן היא ממוקמת על ציר ה-X)
+        # 4. מציאת ה"עוגן" של עמודת השם (היכן היא ממוקמת על ציר ה-X)
         name_col_center_x = None
         for w in words:
             if "שם" in w['text'] or "מועמד" in w['text'] or "פרטי" in w['text']:
                 name_col_center_x = w['center_x']
                 break
                 
-        # 3. קיבוץ המילים לשורות אופקיות לפי ציר Y
+        # 5. קיבוץ המילים לשורות אופקיות לפי ציר Y (מוגן מזוויות צילום בזכות ה-Tolerance)
         words.sort(key=lambda w: w['center_y'])
         rows = []
         current_row = []
-        # חישוב גובה ממוצע כדי לדעת מה הסטייה המותרת לשורה
-        median_height = sorted([w['height'] for w in words])[len(words)//2] if words else 20
+        heights = [w['height'] for w in words]
+        median_height = sorted(heights)[len(heights)//2] if heights else 20
         y_tolerance = median_height * 0.7  
         
         for w in words:
@@ -109,16 +101,15 @@ async def process_image(file: UploadFile = File(...)):
             
         structured_data = []
         
-        # 4. ניתוח חכם של כל שורה
+        # 6. ניתוח חכם של כל שורה
         for row in rows:
-            # מיון השורה מימין לשמאל (כמו בעברית)
+            # מיון השורה מימין לשמאל
             row.sort(key=lambda w: w['left'], reverse=True)
             
-            # חיבור השורה לטקסט מלא כדי לבדוק אם יש כאן "עוגן" (טלפון)
             row_full_text = " ".join([w['text'] for w in row])
             phone_match = phone_pattern.search(row_full_text)
             
-            # אם אין טלפון בשורה הזו בגובה הזה - מדלגים. זה מסנן את כל ה"רעש".
+            # עוגן טלפון: אם אין טלפון בשורה בגובה הזה - מדלגים.
             if not phone_match:
                 continue
                 
@@ -126,7 +117,7 @@ async def process_image(file: UploadFile = File(...)):
             date = date_pattern.search(row_full_text).group(1) if date_pattern.search(row_full_text) else ""
             time = time_pattern.search(row_full_text).group(1) if time_pattern.search(row_full_text) else ""
             
-            # 5. חיתוך השורה לתאים לפי המרחק (רווחים פיזיים גדולים בין מילים)
+            # חיתוך השורה לתאים לפי המרחק בין המילים
             cells = []
             current_cell = []
             for i, word in enumerate(row):
@@ -134,11 +125,10 @@ async def process_image(file: UploadFile = File(...)):
                     current_cell.append(word)
                 else:
                     prev_word = row[i-1]
-                    # המרחק בין המילה הימנית (הקודמת) למילה השמאלית (הנוכחית)
                     gap = prev_word['left'] - word['right']
                     gap_threshold = max(word['height'] * 1.2, 20)
                     
-                    if gap > gap_threshold: # רווח גדול = עמודה חדשה
+                    if gap > gap_threshold: 
                         cells.append(current_cell)
                         current_cell = [word]
                     else:
@@ -146,10 +136,9 @@ async def process_image(file: UploadFile = File(...)):
             if current_cell:
                 cells.append(current_cell)
                 
-            # 6. מציאת התא ששייך לעמודת השם!
+            # מציאת התא ששייך לעמודת השם לפי ה-X
             best_name_text = ""
             if name_col_center_x is not None:
-                # מחפשים את התא שהמרכז שלו הכי קרוב למרכז של כותרת "שם מלא"
                 min_dist = float('inf')
                 for cell in cells:
                     cell_center_x = sum(w['center_x'] for w in cell) / len(cell)
@@ -158,7 +147,6 @@ async def process_image(file: UploadFile = File(...)):
                         min_dist = dist
                         best_name_text = " ".join([w['text'] for w in cell])
             else:
-                # גיבוי: אם לא מצאנו כותרת, ניקח את התא הראשון מימין שיש בו אותיות בעברית
                 for cell in cells:
                     text = " ".join([w['text'] for w in cell])
                     if len(re.sub(r'[^\u0590-\u05fe]', '', text)) >= 2:
