@@ -2,12 +2,11 @@ FROM python:3.9-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# התקנת Tesseract, חבילות שפה וספריות תלות קריטיות של לינוקס
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     tesseract-ocr-heb \
     tesseract-ocr-eng \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     libgomp1 \
     libleptonica-dev \
