@@ -38,10 +38,16 @@ async def process_image(file: UploadFile = File(...)):
         nparr = np.frombuffer(file_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
+        if img is None:
+            return JSONResponse(content={"status": "error", "message": "קובץ התמונה פגום או לא קריא"}, status_code=400)
+            
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
-        # הרצת Tesseract המקומי בקונטיינר
-        d = pytesseract.image_to_data(gray, lang='heb+eng', config='--psm 6', output_type=Output.DICT)
+        # הרצת Tesseract המקומי
+        try:
+            d = pytesseract.image_to_data(gray, lang='heb+eng', config='--psm 6', output_type=Output.DICT)
+        except Exception as tesseract_err:
+            return JSONResponse(content={"status": "error", "message": f"שגיאת מנוע OCR מקומי: {str(tesseract_err)}"}, status_code=500)
         
         words = []
         n_boxes = len(d['text'])
