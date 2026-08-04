@@ -6,9 +6,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tesseract-ocr \
         tesseract-ocr-heb \
         tesseract-ocr-eng \
+        curl \
         libgl1 \
         libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
+
+# Debian ships the "fast" Hebrew model, which trades accuracy for speed. The
+# "best" model is markedly more accurate on Hebrew, and we only run it over a
+# single narrow column, so the extra cost is small. If the download fails the
+# build still succeeds and the packaged model stays in place.
+RUN curl -fsSL --retry 3 -o /tmp/heb.traineddata \
+      https://raw.githubusercontent.com/tesseract-ocr/tessdata_best/main/heb.traineddata \
+    && mv /tmp/heb.traineddata /usr/share/tesseract-ocr/5/tessdata/heb.traineddata \
+    && echo "installed tessdata_best Hebrew model" \
+    || echo "download failed - keeping the packaged Hebrew model"
 
 WORKDIR /app
 

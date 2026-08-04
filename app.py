@@ -54,7 +54,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 import pytesseract
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageOps
 
@@ -348,6 +348,92 @@ def widen_to_content(anchor: tuple[int, int], words: list[Word],
             min(page_width - 2, int(max(right + pad, anchor[1]))))
 
 
+def detect_columns(words: list[Word], page_width: int,
+                   row_height: float) -> list[tuple[int, int]]:
+    """
+    Find the sheet's column boundaries from every word at once.
+
+    Splitting each row on its own was the bug behind names like "לוחם ימי":
+    one row's word gaps are noisy, and a single row where two columns happen to
+    sit close together merges them permanently. Columns are a property of the
+    whole sheet, so project every word onto the x axis and look for the vertical
+    corridors that no word crosses. Those corridors are the column rules.
+    """
+    if not words:
+        return []
+    occupied = np.zeros(page_width + 2, dtype=bool)
+    for w in words:
+        occupied[max(0, w.x):min(page_width, w.right) + 1] = True
+
+    # a corridor narrower than this is just the space between two words
+    min_corridor = max(6, int(row_height * 0.45))
+
+    columns: list[tuple[int, int]] = []
+    start = None
+    gap = 0
+    for x in range(page_width + 2):
+        if occupied[x]:
+            if start is None:
+                start = x
+            elif gap and gap < min_corridor:
+                pass                       # word spacing: stay in this column
+            gap = 0
+        else:
+            if start is not None:
+                gap += 1
+                if gap >= min_corridor:
+                    columns.append((start, x - gap))
+                    start, gap = None, 0
+    if start is not None:
+        columns.append((start, page_width))
+
+    return [c for c in columns if c[1] - c[0] >= row_height * 0.4]
+
+
+def cells_in_column(words: list[Word], column: tuple[int, int],
+                    row_height: float) -> dict[int, tuple[float, str, float]]:
+    """Everything inside one column, grouped into rows."""
+    x0, x1 = column
+    inside = [w for w in words if w.x >= x0 - 2 and w.right <= x1 + 2]
+    out: dict[int, tuple[float, str, float]] = {}
+    for row in group_rows(inside, tolerance=row_height * 0.45):
+        got = clean_name(row)
+        if got:
+            out[round(row[0].y / (row_height * 0.5))] = (row[0].y, got[0], got[1])
+    return out
+
+
+def choose_name_column(words: list[Word], page_width: int, row_height: float,
+                       header_anchor: tuple[int, int] | None
+                       ) -> tuple[int, int] | None:
+    """
+    Pick the column holding the names.
+
+    If the "שם מלא" heading was read, use whichever column contains it — the
+    sheet labelling itself is the best evidence available. Otherwise take the
+    rightmost column that actually holds name-shaped text in most rows, because
+    these sheets are right-to-left and every other Hebrew column (role, unit,
+    rank, status) sits to the left of the name.
+    """
+    columns = detect_columns(words, page_width, row_height)
+    if not columns:
+        return None
+
+    if header_anchor:
+        centre = (header_anchor[0] + header_anchor[1]) / 2
+        for column in columns:
+            if column[0] <= centre <= column[1]:
+                return column
+
+    best: tuple[int, int] | None = None
+    for column in sorted(columns, key=lambda c: -c[1]):     # rightmost first
+        filled = cells_in_column(words, column, row_height)
+        if len(filled) >= 3:
+            best = column
+            break
+    return best
+
+
 def band_from_rows(words: list[Word], row_height: float,
                    page_width: int) -> tuple[int, int] | None:
     """Fallback when the heading can't be read: the rightmost cell of each data
@@ -439,7 +525,10 @@ def load_image(data: bytes) -> np.ndarray:
     return gray
 
 
-def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
+def extract_contacts(source: np.ndarray,
+                     manual_name: tuple[int, int] | None = None,
+                     manual_phone: tuple[int, int] | None = None,
+                     ) -> tuple[list[Contact], dict]:
     started = time.monotonic()
     H, W = source.shape
     info: dict = {"width": W, "height": H}
@@ -449,17 +538,34 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
     locate_img = (source if f == 1.0 else
                   cv2.resize(source, None, fx=f, fy=f, interpolation=cv2.INTER_AREA))
     hits = locate_phones(locate_img)
+    for w in hits:                                   # back to source coordinates
+        w.x, w.width = int(w.x / f), int(w.width / f)
+        w.y, w.height = w.y / f, int(w.height / f)
+
+    if manual_phone:
+        # keep only what falls in the column the user marked
+        hits = [w for w in hits
+                if manual_phone[0] - 10 <= (w.x + w.right) / 2 <= manual_phone[1] + 10]
+        info["phone_band_source"] = "manual"
+
     info["located"] = len(hits)
     log.info("stage 1 located %d phone-shaped cells in %.1fs", len(hits),
              time.monotonic() - started)
 
+    if len(hits) < 2 and manual_phone:
+        # The wide pass found nothing usable, but we know where to look, so
+        # bootstrap the row geometry from the marked column alone.
+        boot = read_phone_column(source, manual_phone, 0, H, 2.0)
+        spacing = float(np.median(np.diff(sorted(y for y, _, _ in boot)))) if len(boot) > 2 else 20.0
+        hits = [Word(phone, manual_phone[0], y, max(8, int(spacing * 0.5)),
+                     manual_phone[1] - manual_phone[0], conf)
+                for y, phone, conf in boot]
+        info["located"] = len(hits)
+        info["phone_band_source"] = "manual-bootstrap"
+
     if len(hits) < 2:
         info["reason"] = "no phone column found"
         return [], info
-
-    for w in hits:                                   # back to source coordinates
-        w.x, w.width = int(w.x / f), int(w.width / f)
-        w.y, w.height = w.y / f, int(w.height / f)
 
     ys = sorted(w.y for w in hits)
     row_height = float(np.median(np.diff(ys))) if len(ys) > 2 else hits[0].height * 2
@@ -473,7 +579,7 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
     rows_bottom = min(H, int(max(ys) + pad))
     digit_scale = float(np.clip(TARGET_DIGIT_PX / max(6.0, row_height * 0.5), 1.0, 3.0))
     name_scale = float(np.clip(TARGET_NAME_PX / max(6.0, row_height * 0.5), 1.0, 3.5))
-    band = phone_band(hits, W)
+    band = manual_phone or phone_band(hits, W)
     info.update({"row_height": round(row_height, 1), "phone_band": list(band)})
 
     # --- stage 2: read the phone column -----------------------------------
@@ -511,22 +617,35 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
         t = time.monotonic()
         # start above the data rows so the heading row is inside the crop
         survey_top = max(0, int(rows_top - row_height * 2))
-        survey = survey_names(source, band[1], survey_top, rows_bottom, digit_scale)
-        name_band = band_from_header(survey, row_height, W)
-        if name_band:
+        survey = survey_names(source, 0, survey_top, rows_bottom, digit_scale)
+        survey = [w for w in survey if w.x >= band[1] - row_height]
+
+        anchor = manual_name or band_from_header(survey, row_height, W)
+        if manual_name:
+            info["band_source"] = "manual"
+        elif anchor:
             info["band_source"] = "header"
-            name_band = widen_to_content(name_band, survey, row_height, W)
+
+        # A hand-drawn band is only an anchor: it snaps to whichever detected
+        # column it lands in, so the stroke doesn't have to be accurate.
+        column = choose_name_column(survey, W, row_height, anchor)
+        if column:
+            pad = int(row_height * 0.3)
+            name_band = (max(2, column[0] - pad), min(W - 2, column[1] + pad))
+            info.setdefault("band_source", "columns")
+        elif anchor:
+            name_band = widen_to_content(anchor, survey, row_height, W)
         else:
-            name_band = band_from_rows(survey, row_height, W)
-            info["band_source"] = "rows" if name_band else "none"
-        log.info("stage 3 surveyed %d words, name band %s (%s) in %.1fs",
-                 len(survey), name_band, info.get("band_source"),
-                 time.monotonic() - t)
-        # whatever the survey already read is a usable fallback per row
-        names = names_by_row([w for w in survey
-                              if name_band is None
-                              or name_band[0] - row_height <= w.x <= name_band[1] + row_height],
-                             row_height)
+            info["band_source"] = "none"
+
+        log.info("stage 3 surveyed %d words, %d columns, name band %s (%s) in %.1fs",
+                 len(survey), len(detect_columns(survey, W, row_height)), name_band,
+                 info.get("band_source"), time.monotonic() - t)
+
+        if name_band:
+            names = cells_in_column(survey, name_band, row_height)
+        else:
+            names = names_by_row(survey, row_height)
 
     # --- stage 4: read the name column on its own -------------------------
     if name_band and time.monotonic() - started < TIME_BUDGET_SECONDS:
@@ -578,8 +697,25 @@ def health() -> dict:
     }
 
 
+def parse_band(raw: str | None, width: int) -> tuple[int, int] | None:
+    """A band arrives as two fractions of the image width, "0.61,0.78", so it
+    survives the client resizing the photo before upload."""
+    if not raw:
+        return None
+    try:
+        a, b = (float(v) for v in raw.split(",")[:2])
+    except ValueError:
+        return None
+    x0, x1 = sorted((a, b))
+    if not (0.0 <= x0 < x1 <= 1.0) or x1 - x0 < 0.005:
+        return None
+    return max(2, int(x0 * width)), min(width - 2, int(x1 * width))
+
+
 @app.post("/extract")
-async def extract(image: UploadFile = File(...)) -> dict:
+async def extract(image: UploadFile = File(...),
+                  name_band: str | None = Form(None),
+                  phone_band: str | None = Form(None)) -> dict:
     data = await image.read()
     if not data:
         raise HTTPException(400, "No image was uploaded.")
@@ -587,7 +723,12 @@ async def extract(image: UploadFile = File(...)) -> dict:
         raise HTTPException(413, "That image is larger than 12 MB.")
 
     started = time.monotonic()
-    contacts, info = extract_contacts(load_image(data))
+    source = load_image(data)
+    contacts, info = extract_contacts(
+        source,
+        manual_name=parse_band(name_band, source.shape[1]),
+        manual_phone=parse_band(phone_band, source.shape[1]),
+    )
     seconds = round(time.monotonic() - started, 1)
     log.info("extracted %d contacts in %.1fs %s", len(contacts), seconds, info)
 
