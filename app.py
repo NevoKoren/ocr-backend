@@ -71,7 +71,7 @@ MAX_UPLOAD_BYTES = 12 * 1024 * 1024
 MAX_SOURCE_WIDTH = 4000       # cap the original, for memory
 LOCATE_WIDTH = 1800           # the cheap first pass runs here
 TARGET_DIGIT_PX = 30          # Tesseract's comfort zone for digit height
-TARGET_NAME_PX = 36           # Hebrew letters are denser; give them more room
+TARGET_NAME_PX = 48           # measured: 44-56 clearly beats 36 on faint text
 MAX_CROP_PIXELS = 3_000_000   # ceiling on any single enlarged crop
 
 TIME_BUDGET_SECONDS = float(os.getenv("TIME_BUDGET_SECONDS", "55"))
@@ -463,26 +463,36 @@ def band_from_rows(words: list[Word], row_height: float,
 def read_name_column(source: np.ndarray, band: tuple[int, int],
                      top: int, bottom: int,
                      scale: float) -> list[Word]:
-    """One column, cropped and enlarged. Now that it really is a single block
-    of text, PSM 6 applies — and it beats sparse mode here."""
+    """
+    One column, cropped and enlarged. Now that it really is a single block of
+    text, PSM 6 applies — and it beats sparse mode here.
+
+    Measured on a degraded fixture at 10px letter height (about what a distant
+    phone photo gives): plain grayscale scored 20/25 and a mild unsharp mask
+    22/25, while CLAHE dropped to 14 and Otsu to 15. So only those two variants
+    are tried, and the stronger filtering that helps scanned documents is
+    deliberately absent.
+    """
     x0, x1 = band
     crop = source[top:bottom, x0:x1]
     if crop.size == 0:
         return []
     enlarged, applied = enlarge(crop, scale)
+    sharpened = cv2.addWeighted(enlarged, 1.5,
+                                cv2.GaussianBlur(enlarged, (0, 0), 1.2), -0.5, 0)
 
     best: list[Word] = []
-    for psm in (6, 4, 11):
+    best_score = (-1, 0.0)
+    for image, psm in ((enlarged, 6), (sharpened, 6), (enlarged, 11)):
         try:
-            words = read_words(enlarged, psm=psm, lang=NAME_LANG)
+            words = read_words(image, psm=psm, lang=NAME_LANG)
         except pytesseract.TesseractError as exc:
             log.error("name column read failed (psm %d): %s", psm, exc)
             return []
         keep = [w for w in words if LETTERS.search(w.text)]
-        if len(keep) > len(best):
-            best = keep
-        if len(best) >= 5:
-            break
+        score = (len(keep), float(np.mean([w.conf for w in keep])) if keep else 0.0)
+        if score > best_score:
+            best, best_score = keep, score
 
     for w in best:
         w.x = int(x0 + w.x / applied)
@@ -578,9 +588,16 @@ def extract_contacts(source: np.ndarray,
     rows_top = max(0, int(min(ys) - pad))
     rows_bottom = min(H, int(max(ys) + pad))
     digit_scale = float(np.clip(TARGET_DIGIT_PX / max(6.0, row_height * 0.5), 1.0, 3.0))
-    name_scale = float(np.clip(TARGET_NAME_PX / max(6.0, row_height * 0.5), 1.0, 3.5))
+    name_scale = float(np.clip(TARGET_NAME_PX / max(6.0, row_height * 0.5), 1.0, 4.0))
     band = manual_phone or phone_band(hits, W)
-    info.update({"row_height": round(row_height, 1), "phone_band": list(band)})
+    letter_px = int(np.median([w.height for w in hits]))
+    info.update({"row_height": round(row_height, 1), "phone_band": list(band),
+                 "letter_px": letter_px})
+    if letter_px < 15:
+        # below roughly this size Hebrew stops being recoverable, while the
+        # digit whitelist keeps phones working - worth saying so explicitly
+        info["warning"] = "text_too_small_for_names"
+        log.warning("letters are only %dpx tall - Hebrew names will be unreliable", letter_px)
 
     # --- stage 2: read the phone column -----------------------------------
     # Neither pass dominates: on one test photo the wide pass found 25 rows and
@@ -630,7 +647,7 @@ def extract_contacts(source: np.ndarray,
         # column it lands in, so the stroke doesn't have to be accurate.
         column = choose_name_column(survey, W, row_height, anchor)
         if column:
-            pad = int(row_height * 0.3)
+            pad = int(row_height * 0.5)
             name_band = (max(2, column[0] - pad), min(W - 2, column[1] + pad))
             info.setdefault("band_source", "columns")
         elif anchor:
