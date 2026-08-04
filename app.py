@@ -21,6 +21,7 @@ import io
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 
 import cv2
@@ -43,8 +44,24 @@ ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",
 
 MAX_UPLOAD_BYTES = 12 * 1024 * 1024
 MIN_WORK_WIDTH = 1400      # upscale smaller images; small text OCRs badly
-MAX_WORK_WIDTH = 2600      # and downscale huge ones, for speed
+MAX_WORK_WIDTH = 2200      # and downscale huge ones, for speed
 OCR_LANGS = "heb+eng"
+
+# Hard wall-clock ceiling for the OCR attempts. A free Render instance gets a
+# fraction of a CPU, so an unbounded "try everything" loop runs for minutes and
+# the browser gives up first. We spend the budget on the most promising passes
+# and return whatever we have when it runs out — a partial list beats a timeout.
+TIME_BUDGET_SECONDS = float(os.getenv("TIME_BUDGET_SECONDS", "45"))
+
+# Ordered by how often each combination wins on a photographed screen. The
+# first entry always runs; the rest run only if there's budget left and the
+# result so far is weak.
+PASSES: tuple[tuple[str, int], ...] = (
+    ("sharp", 6),
+    ("adaptive", 6),
+    ("otsu", 6),
+    ("sharp", 4),
+)
 
 HEBREW = re.compile(r"[\u05D0-\u05EA]")
 NON_NAME = re.compile(r"[^\u05D0-\u05EA\u0027\u0022\s\-׳״]")
@@ -135,27 +152,32 @@ def deskew(gray: np.ndarray) -> np.ndarray:
                           borderMode=cv2.BORDER_REPLICATE)
 
 
-def variants(img: np.ndarray) -> list[tuple[str, np.ndarray]]:
+def prepare_base(img: np.ndarray) -> np.ndarray:
     """
-    Build a few cleaned-up versions of the photo.
+    Clean up the photo once.
 
     A picture of a screen brings problems a scan doesn't: moiré interference
     from the pixel grid, uneven backlight, and glare. medianBlur kills the
     moiré speckle, CLAHE evens out the backlight, and the unsharp mask puts
-    the edges back. We OCR more than one version because which is best
-    depends on the screen and the lighting — and then keep the best result.
+    the edges back.
     """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = deskew(gray)
     gray = cv2.medianBlur(gray, 3)
-
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
-    sharp = cv2.addWeighted(clahe, 1.6, cv2.GaussianBlur(clahe, (0, 0), 3), -0.6, 0)
+    return cv2.addWeighted(clahe, 1.6, cv2.GaussianBlur(clahe, (0, 0), 3), -0.6, 0)
 
-    otsu = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
-    adaptive = cv2.adaptiveThreshold(sharp, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+
+def make_variant(sharp: np.ndarray, label: str) -> np.ndarray:
+    """Derive one binarisation on demand. Which one reads best depends on the
+    screen and the lighting, so we keep more than one available — but we only
+    build and OCR the ones we actually get to."""
+    if label == "otsu":
+        return cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+    if label == "adaptive":
+        return cv2.adaptiveThreshold(sharp, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                      cv2.THRESH_BINARY, 31, 12)
-    return [("sharp", sharp), ("otsu", otsu), ("adaptive", adaptive)]
+    return sharp
 
 
 # --------------------------------------------------------------------------
@@ -180,7 +202,8 @@ class Word:
 class Contact:
     name: str
     phone: str
-    confidence: int
+    confidence: int      # what the site shows — may be lowered on ambiguity
+    raw_conf: int = 0    # what Tesseract actually reported, used to judge a pass
     row_text: str = field(default="")
 
 
@@ -286,45 +309,71 @@ def contact_from_row(row: list[Word]) -> Contact | None:
     confs = [w.conf for w, _ in chosen]
 
     name = " ".join(parts)
-    confidence = int(round(np.mean(confs + [phone_conf])))
+    raw_conf = int(round(np.mean(confs + [phone_conf])))
+    confidence = raw_conf
     if len(cells) > 1:
-        # more than one Hebrew column means we had to guess — say so, and the
-        # site will flag the row for a human to glance at
+        # more than one Hebrew column means we had to guess which is the name —
+        # flag the row for a human, but don't let that penalty make the OCR pass
+        # itself look bad, or we'd never stop retrying a perfectly good read
         confidence = min(confidence, 68)
     return Contact(name=name, phone=phone, confidence=confidence,
-                   row_text=" ".join(w.text for w in row))
+                   raw_conf=raw_conf, row_text=" ".join(w.text for w in row))
+
+
+def good_enough(found: list[Contact]) -> bool:
+    """Stop early on a solid read. Judged on raw OCR confidence, not the
+    displayed one, and on the median so a single bad row doesn't force a
+    retry that costs another 30 seconds."""
+    if len(found) < 3:
+        return False
+    return float(np.median([c.raw_conf for c in found])) >= 72
 
 
 def extract_contacts(img: np.ndarray) -> tuple[list[Contact], str]:
-    """OCR several preprocessing/segmentation combinations, keep the best."""
+    """Try OCR passes in order of expected value, stopping when the result is
+    good enough or the time budget is spent — whichever comes first."""
+    started = time.monotonic()
+    sharp = prepare_base(img)
+    cache: dict[str, np.ndarray] = {}
+
     best: list[Contact] = []
     best_label = "none"
 
-    for label, prepared in variants(img):
-        for psm in (6, 4):
-            try:
-                rows = group_rows(ocr_words(prepared, psm))
-            except pytesseract.TesseractError as exc:
-                log.warning("tesseract failed on %s/psm%s: %s", label, psm, exc)
-                continue
+    for index, (label, psm) in enumerate(PASSES):
+        elapsed = time.monotonic() - started
+        if index and elapsed > TIME_BUDGET_SECONDS:
+            log.info("time budget spent after %.1fs, returning %d contacts",
+                     elapsed, len(best))
+            break
 
-            found = [c for c in (contact_from_row(r) for r in rows) if c]
+        if label not in cache:
+            cache[label] = make_variant(sharp, label)
 
-            # de-duplicate on the phone number, keeping the surest reading
-            by_phone: dict[str, Contact] = {}
-            for c in found:
-                if c.phone not in by_phone or c.confidence > by_phone[c.phone].confidence:
-                    by_phone[c.phone] = c
-            found = list(by_phone.values())
+        pass_start = time.monotonic()
+        try:
+            rows = group_rows(ocr_words(cache[label], psm))
+        except pytesseract.TesseractError as exc:
+            log.warning("tesseract failed on %s/psm%s: %s", label, psm, exc)
+            continue
 
-            score = (len(found), sum(c.confidence for c in found))
-            best_score = (len(best), sum(c.confidence for c in best))
-            if score > best_score:
-                best, best_label = found, f"{label}/psm{psm}"
+        found = [c for c in (contact_from_row(r) for r in rows) if c]
 
-            # a clean, high-confidence read — no need to try the rest
-            if len(best) >= 5 and all(c.confidence >= 80 for c in best):
-                return best, best_label
+        # de-duplicate on the phone number, keeping the surest reading
+        by_phone: dict[str, Contact] = {}
+        for c in found:
+            if c.phone not in by_phone or c.raw_conf > by_phone[c.phone].raw_conf:
+                by_phone[c.phone] = c
+        found = list(by_phone.values())
+
+        log.info("pass %s/psm%d: %d contacts in %.1fs",
+                 label, psm, len(found), time.monotonic() - pass_start)
+
+        if (len(found), sum(c.raw_conf for c in found)) > \
+           (len(best), sum(c.raw_conf for c in best)):
+            best, best_label = found, f"{label}/psm{psm}"
+
+        if good_enough(best):
+            return best, best_label
 
     return best, best_label
 
@@ -354,9 +403,11 @@ async def extract(image: UploadFile = File(...)) -> dict:
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, "That image is larger than 12 MB.")
 
+    started = time.monotonic()
     img = resize_to_work(load_image(data))
     contacts, method = extract_contacts(img)
-    log.info("extracted %d contacts using %s", len(contacts), method)
+    seconds = round(time.monotonic() - started, 1)
+    log.info("extracted %d contacts using %s in %.1fs", len(contacts), method, seconds)
 
     return {
         "contacts": [
@@ -365,6 +416,7 @@ async def extract(image: UploadFile = File(...)) -> dict:
         ],
         "count": len(contacts),
         "method": method,
+        "seconds": seconds,
     }
 
 

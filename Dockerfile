@@ -18,6 +18,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 
 ENV PYTHONUNBUFFERED=1
+
+# Tesseract is built with OpenMP. Given a fraction of a CPU it spawns threads
+# that contend for the same core and ends up SLOWER than single-threaded —
+# often by 2-3x. This one line is the difference between 20s and 60s a pass.
+ENV OMP_THREAD_LIMIT=1
+
+# How long the server may spend on OCR attempts before returning what it has.
+ENV TIME_BUDGET_SECONDS=45
+
 EXPOSE 8000
 
 # Render supplies $PORT at runtime, so bind to it rather than a fixed port.
