@@ -3,16 +3,38 @@
 Extracts (Hebrew name, Israeli mobile) pairs from a phone photo of a
 spreadsheet displayed on a computer screen.
 
-Pairing strategy
-----------------
-Columns are unreliable: the name and the phone sit on the same visual ROW,
-but not necessarily in adjacent columns, and Tesseract often splits a table
-into several blocks. So we ignore Tesseract's own block/line numbering and
-regroup every recognised word by its vertical position on the page. Words
-whose vertical centres fall within a fraction of the median word height are
-one row. Inside a row we look for an Israeli mobile number and take the
-Hebrew words as the name. That survives extra columns, empty cells and
-column order changes for free.
+Pipeline
+--------
+Reading the whole photo at once fails: the table is a fraction of the frame,
+so the row text lands around 12px tall and Tesseract needs roughly 30px. And
+a page-wide read has to guess at a multi-column layout it can't see.
+
+So this works in three stages instead, each measured against real photos:
+
+  1. LOCATE  — cheap pass over a downscaled copy, digits only, to find where
+               the phone column sits and where the data rows are.
+  2. PHONES  — re-read that one column, cropped from the full-resolution
+               original and enlarged. On a test sheet this went from 15 of 20
+               rows to 19 of 20, and corrected a digit the wide pass got wrong.
+  3. NAMES   — read only the area to the right of the phone column, cropped
+               to the rows found in stage 1.
+
+Then the two are paired by vertical position.
+
+Two findings drove the shape of this, both contrary to the obvious approach:
+
+  * Plain grayscale beats denoise + CLAHE + unsharp masking. At this text size
+    the filtering erased thin strokes: 25 phones found versus 7 on the same
+    photo. There is no preprocessing chain here on purpose.
+  * PSM 11 (sparse text) beats PSM 6 (uniform block) roughly fourfold. A
+    spreadsheet is not a block of prose, and telling Tesseract it is makes it
+    force text into a layout that isn't there.
+
+Why the name is taken as the rightmost Hebrew cell in a row: these sheets are
+right-to-left, so the name column sits at or near column A, and every other
+Hebrew column (role, unit, rank, status, notes) falls to its left. Picking the
+longest or most confident Hebrew cell instead reliably picks a role like
+"לוחם ימי גברים" over the actual name.
 """
 
 from __future__ import annotations
@@ -22,7 +44,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -38,39 +60,29 @@ log = logging.getLogger("extractor")
 # Configuration
 # --------------------------------------------------------------------------
 
-# Comma-separated list, e.g. "https://my-app.web.app,https://my-app.firebaseapp.com"
-# "*" is fine while developing; tighten it once the site is live.
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
 
 MAX_UPLOAD_BYTES = 12 * 1024 * 1024
-MIN_WORK_WIDTH = 1400      # upscale smaller images; small text OCRs badly
-MAX_WORK_WIDTH = 2200      # and downscale huge ones, for speed
-OCR_LANGS = "heb+eng"
+MAX_SOURCE_WIDTH = 4000      # cap the original, for memory
+LOCATE_WIDTH = 1800          # the cheap first pass runs here
+TARGET_TEXT_PX = 30          # Tesseract's comfort zone for letter height
+MAX_CROP_PIXELS = 3_000_000  # ceiling on any single enlarged crop
 
-# Hard wall-clock ceiling for the OCR attempts. A free Render instance gets a
-# fraction of a CPU, so an unbounded "try everything" loop runs for minutes and
-# the browser gives up first. We spend the budget on the most promising passes
-# and return whatever we have when it runs out — a partial list beats a timeout.
-TIME_BUDGET_SECONDS = float(os.getenv("TIME_BUDGET_SECONDS", "45"))
-
-# Ordered by how often each combination wins on a photographed screen. The
-# first entry always runs; the rest run only if there's budget left and the
-# result so far is weak.
-PASSES: tuple[tuple[str, int], ...] = (
-    ("sharp", 6),
-    ("adaptive", 6),
-    ("otsu", 6),
-    ("sharp", 4),
-)
+TIME_BUDGET_SECONDS = float(os.getenv("TIME_BUDGET_SECONDS", "55"))
 
 HEBREW = re.compile(r"[\u05D0-\u05EA]")
 NON_NAME = re.compile(r"[^\u05D0-\u05EA\u0027\u0022\s\-׳״]")
+DIGITS_ONLY = "0123456789-"
 
-# Words that are almost certainly a column header, not a person
-HEADER_WORDS = {"שם", "שמות", "טלפון", "טלפונים", "נייד", "פלאפון",
-                "מספר", "משפחה", "פרטי", "איש", "קשר", "כתובת", "מייל"}
+# Column headings and stock cell values that are never a person's name.
+NOT_A_NAME = {
+    "שם", "שמות", "מלא", "טלפון", "נייד", "פלאפון", "מספר", "אישי", "תז",
+    "משפחה", "פרטי", "איש", "קשר", "כתובת", "מייל", "תפקיד", "רמה", "סוג",
+    "גיל", "דרגה", "סמכות", "יחידה", "הערות", "סטטוס", "שעת", "זימון",
+    "מתחקר", "המתחקר", "שבוע", "בדיקה", "התייצבות", "במגן",
+}
 
-app = FastAPI(title="Hebrew contact extractor", version="1.0")
+app = FastAPI(title="Hebrew contact extractor", version="2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -80,118 +92,14 @@ app.add_middleware(
 )
 
 
-# --------------------------------------------------------------------------
-# Phone handling
-# --------------------------------------------------------------------------
-
-def normalize_phone(raw: str) -> str | None:
-    """Return a clean 05XXXXXXXX string, or None if it isn't an Israeli mobile."""
-    digits = re.sub(r"\D", "", raw or "")
-    if digits.startswith("972"):
-        digits = "0" + digits[3:]
-    elif digits.startswith("00972"):
-        digits = "0" + digits[5:]
-    if len(digits) == 9 and digits.startswith("5"):
-        digits = "0" + digits          # the leading zero was cropped or lost
-    return digits if re.fullmatch(r"05\d{8}", digits) else None
-
-
-def phone_from_candidate(text: str) -> str | None:
-    """
-    Try a digit string as-is and reversed.
-
-    Tesseract renders digits inside right-to-left text in logical order, but a
-    photo of a screen can still hand back a mirrored run when the surrounding
-    cell is detected as RTL. Testing the reverse costs nothing and recovers
-    numbers that would otherwise be discarded.
-    """
-    return normalize_phone(text) or normalize_phone(text[::-1])
-
-
-# --------------------------------------------------------------------------
-# Image preparation
-# --------------------------------------------------------------------------
-
-def load_image(data: bytes) -> np.ndarray:
-    """Decode upload to a BGR array, honouring EXIF rotation from the phone."""
-    try:
-        pil = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
-    except Exception as exc:
-        raise HTTPException(400, f"Could not read that image: {exc}") from exc
-    return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
-
-
-def resize_to_work(img: np.ndarray) -> np.ndarray:
-    h, w = img.shape[:2]
-    if w < MIN_WORK_WIDTH:
-        scale = MIN_WORK_WIDTH / w
-    elif w > MAX_WORK_WIDTH:
-        scale = MAX_WORK_WIDTH / w
-    else:
-        return img
-    return cv2.resize(img, (int(w * scale), int(h * scale)),
-                      interpolation=cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA)
-
-
-def deskew(gray: np.ndarray) -> np.ndarray:
-    """Straighten small rotations. Big angles are left alone — a bad guess
-    hurts more than a slight tilt."""
-    inv = cv2.bitwise_not(gray)
-    _, bw = cv2.threshold(inv, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-    coords = cv2.findNonZero(bw)
-    if coords is None:
-        return gray
-    angle = cv2.minAreaRect(coords)[-1]
-    if angle > 45:
-        angle -= 90
-    if abs(angle) < 0.4 or abs(angle) > 8:
-        return gray
-    h, w = gray.shape
-    m = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-    return cv2.warpAffine(gray, m, (w, h), flags=cv2.INTER_CUBIC,
-                          borderMode=cv2.BORDER_REPLICATE)
-
-
-def prepare_base(img: np.ndarray) -> np.ndarray:
-    """
-    Clean up the photo once.
-
-    A picture of a screen brings problems a scan doesn't: moiré interference
-    from the pixel grid, uneven backlight, and glare. medianBlur kills the
-    moiré speckle, CLAHE evens out the backlight, and the unsharp mask puts
-    the edges back.
-    """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = deskew(gray)
-    gray = cv2.medianBlur(gray, 3)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
-    return cv2.addWeighted(clahe, 1.6, cv2.GaussianBlur(clahe, (0, 0), 3), -0.6, 0)
-
-
-def make_variant(sharp: np.ndarray, label: str) -> np.ndarray:
-    """Derive one binarisation on demand. Which one reads best depends on the
-    screen and the lighting, so we keep more than one available — but we only
-    build and OCR the ones we actually get to."""
-    if label == "otsu":
-        return cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
-    if label == "adaptive":
-        return cv2.adaptiveThreshold(sharp, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                     cv2.THRESH_BINARY, 31, 12)
-    return sharp
-
-
-# --------------------------------------------------------------------------
-# OCR + row assembly
-# --------------------------------------------------------------------------
-
 @dataclass
 class Word:
     text: str
     x: int
-    y_centre: float
+    y: float          # vertical centre
     height: int
+    width: int
     conf: float
-    width: int = 0
 
     @property
     def right(self) -> int:
@@ -202,17 +110,36 @@ class Word:
 class Contact:
     name: str
     phone: str
-    confidence: int      # what the site shows — may be lowered on ambiguity
-    raw_conf: int = 0    # what Tesseract actually reported, used to judge a pass
-    row_text: str = field(default="")
+    confidence: int
 
 
-def ocr_words(image: np.ndarray, psm: int) -> list[Word]:
-    data = pytesseract.image_to_data(
-        image, lang=OCR_LANGS,
-        config=f"--oem 1 --psm {psm} -c preserve_interword_spaces=1",
-        output_type=pytesseract.Output.DICT,
-    )
+# --------------------------------------------------------------------------
+# Phone parsing
+# --------------------------------------------------------------------------
+
+def normalize_phone(raw: str) -> str | None:
+    """Return a clean 05XXXXXXXX string, or None if it isn't an Israeli mobile."""
+    digits = re.sub(r"\D", "", raw or "")
+    if digits.startswith("00972"):
+        digits = "0" + digits[5:]
+    elif digits.startswith("972"):
+        digits = "0" + digits[3:]
+    if len(digits) == 9 and digits.startswith("5"):
+        digits = "0" + digits           # leading zero cropped or dropped
+    return digits if re.fullmatch(r"05\d{8}", digits) else None
+
+
+# --------------------------------------------------------------------------
+# OCR helpers
+# --------------------------------------------------------------------------
+
+def read_words(image: np.ndarray, psm: int, lang: str,
+               whitelist: str | None = None) -> list[Word]:
+    config = f"--oem 1 --psm {psm}"
+    if whitelist:
+        config += f" -c tessedit_char_whitelist={whitelist}"
+    data = pytesseract.image_to_data(image, lang=lang, config=config,
+                                     output_type=pytesseract.Output.DICT)
     words: list[Word] = []
     for i, raw in enumerate(data["text"]):
         text = (raw or "").strip()
@@ -221,161 +148,275 @@ def ocr_words(image: np.ndarray, psm: int) -> list[Word]:
             continue
         h = int(data["height"][i])
         words.append(Word(text, int(data["left"][i]),
-                          int(data["top"][i]) + h / 2, h, conf,
-                          int(data["width"][i])))
+                          int(data["top"][i]) + h / 2, h,
+                          int(data["width"][i]), conf))
     return words
 
 
-def group_rows(words: list[Word]) -> list[list[Word]]:
-    """Cluster words into visual rows by vertical centre."""
-    if not words:
-        return []
-    tolerance = float(np.median([w.height for w in words])) * 0.6
+def enlarge(crop: np.ndarray, scale: float) -> tuple[np.ndarray, float]:
+    """Scale a crop toward Tesseract's comfortable text size, within a pixel
+    ceiling so a big photo can't blow the container's memory."""
+    h, w = crop.shape[:2]
+    if h * w * scale * scale > MAX_CROP_PIXELS:
+        scale = max(1.0, (MAX_CROP_PIXELS / (h * w)) ** 0.5)
+    if scale <= 1.02:
+        return crop, 1.0
+    return cv2.resize(crop, None, fx=scale, fy=scale,
+                      interpolation=cv2.INTER_CUBIC), scale
+
+
+def group_rows(words: list[Word], tolerance: float) -> list[list[Word]]:
     rows: list[list[Word]] = []
-    for w in sorted(words, key=lambda w: w.y_centre):
-        if rows and abs(w.y_centre - rows[-1][0].y_centre) <= tolerance:
+    for w in sorted(words, key=lambda w: w.y):
+        if rows and abs(w.y - rows[-1][0].y) <= tolerance:
             rows[-1].append(w)
         else:
             rows.append([w])
-    # right-to-left reading order inside each row
     for row in rows:
-        row.sort(key=lambda w: -w.x)
+        row.sort(key=lambda w: -w.x)      # right-to-left reading order
     return rows
 
 
-def contact_from_row(row: list[Word]) -> Contact | None:
-    phone, phone_conf, used = None, 0.0, set()
+# --------------------------------------------------------------------------
+# Stage 1 — locate the phone column
+# --------------------------------------------------------------------------
 
-    # A number may arrive whole ("0501234567") or split across neighbouring
-    # tokens ("050" "-" "1234567"), so also try joining runs of digit tokens.
-    digit_idx = [i for i, w in enumerate(row) if sum(c.isdigit() for c in w.text) >= 2]
+def locate_phones(gray: np.ndarray) -> list[Word]:
+    """Cheap wide pass, digits only. We don't trust the numbers it returns —
+    only where on the page they are."""
+    found = []
+    for word in read_words(gray, psm=11, lang="eng", whitelist=DIGITS_ONLY):
+        if normalize_phone(word.text):
+            found.append(word)
+    return found
 
-    for i in digit_idx:
-        found = phone_from_candidate(row[i].text)
-        if found:
-            phone, phone_conf, used = found, row[i].conf, {i}
+
+def phone_band(hits: list[Word], page_width: int) -> tuple[int, int]:
+    """
+    Horizontal extent of the phone column, taken from the numbers themselves
+    plus a small margin.
+
+    The margin matters more than it looks. Too wide and the strip swallows the
+    table's black column rule, which reads as a giant vertical stroke and
+    wrecks sparse-text detection — on a test sheet, widening the margin from
+    0.35 to 0.6 of a cell width dropped the result from 19 rows to 3.
+    """
+    lefts = np.array([w.x for w in hits])
+    rights = np.array([w.right for w in hits])
+    margin = float(np.median(rights - lefts)) * 0.35
+    return (max(2, int(lefts.min() - margin)),
+            min(page_width - 2, int(rights.max() + margin)))
+
+
+# --------------------------------------------------------------------------
+# Stage 2 — re-read the phone column properly
+# --------------------------------------------------------------------------
+
+def read_phone_column(source: np.ndarray, band: tuple[int, int],
+                      rows_top: int, rows_bottom: int,
+                      scale: float) -> list[tuple[float, str, float]]:
+    """Returns (y in source coordinates, phone, confidence)."""
+    x0, x1 = band
+    crop = source[rows_top:rows_bottom, x0:x1]
+    if crop.size == 0:
+        return []
+    enlarged, applied = enlarge(crop, scale)
+
+    out: list[tuple[float, str, float]] = []
+    for word in read_words(enlarged, psm=11, lang="eng", whitelist=DIGITS_ONLY):
+        phone = normalize_phone(word.text)
+        if phone:
+            out.append((rows_top + word.y / applied, phone, word.conf))
+    return out
+
+
+# --------------------------------------------------------------------------
+# Stage 3 — read the names
+# --------------------------------------------------------------------------
+
+def read_name_area(source: np.ndarray, left: int, rows_top: int,
+                   rows_bottom: int, scale: float) -> tuple[list[Word], float, int]:
+    """Everything to the right of the phone column, limited to the data rows.
+    Returns words in source coordinates."""
+    crop = source[rows_top:rows_bottom, left:]
+    if crop.size == 0:
+        return [], 1.0, left
+    enlarged, applied = enlarge(crop, scale)
+
+    best: list[Word] = []
+    for psm in (11, 6):
+        try:
+            words = read_words(enlarged, psm=psm, lang="heb+eng")
+        except pytesseract.TesseractError as exc:
+            # Missing Hebrew traineddata, most likely. Phones are still good,
+            # so return what we have rather than failing the whole request.
+            log.error("Hebrew OCR failed (psm %d): %s", psm, exc)
+            return [], 1.0, left
+        hebrew = [w for w in words if HEBREW.search(w.text)]
+        if len(hebrew) > len(best):
+            best = hebrew
+        if len(best) >= 8:
             break
 
-    if not phone:
-        for start in range(len(digit_idx)):
-            for end in range(start + 1, min(start + 4, len(digit_idx)) + 1):
-                idx = digit_idx[start:end]
-                if idx != list(range(idx[0], idx[-1] + 1)):
-                    continue  # not adjacent tokens
-                joined = "".join(row[i].text for i in idx)
-                found = phone_from_candidate(joined) or phone_from_candidate(joined[::-1])
-                if found:
-                    phone = found
-                    used = set(idx)
-                    phone_conf = float(np.mean([row[i].conf for i in idx]))
-                    break
-            if phone:
-                break
+    for w in best:
+        w.x = int(left + w.x / applied)
+        w.width = int(w.width / applied)
+        w.y = rows_top + w.y / applied
+        w.height = int(w.height / applied)
+    return best, applied, left
 
-    if not phone:
-        return None
 
-    # The name: Hebrew words in this row that aren't part of the number.
-    candidates: list[tuple[Word, str]] = []
-    for i, w in enumerate(row):
-        if i in used or not HEBREW.search(w.text):
-            continue
+def name_from_row(row: list[Word]) -> tuple[str, float] | None:
+    """The rightmost Hebrew cell in the row. Words a space apart are one cell;
+    a wide gap means a new column."""
+    cells: list[list[Word]] = []
+    usable = []
+    for w in row:
         cleaned = NON_NAME.sub("", w.text).strip()
-        if len(cleaned) < 2 or cleaned in HEADER_WORDS:
+        if len(cleaned) < 2 or cleaned in NOT_A_NAME:
             continue
-        candidates.append((w, cleaned))
+        usable.append((w, cleaned))
 
-    if not candidates:
+    if not usable:
         return None
 
-    # A row can hold more than one Hebrew column ("דוד כהן" | "חבר מועדון").
-    # Words inside one cell sit a space apart; a column boundary is a much
-    # wider gap. Split on that gap and treat each group as one cell.
-    gap_limit = float(np.median([w.height for w, _ in candidates])) * 1.6
-    cells: list[list[tuple[Word, str]]] = [[candidates[0]]]
-    for prev, current in zip(candidates, candidates[1:]):
-        # row is in right-to-left order, so the previous word is to the right
+    gap_limit = float(np.median([w.height for w, _ in usable])) * 1.6
+    cells = [[usable[0]]]
+    for prev, current in zip(usable, usable[1:]):
         if prev[0].x - current[0].right > gap_limit:
             cells.append([current])
         else:
             cells[-1].append(current)
 
-    # Pick the cell with the most Hebrew text; ties go to the rightmost, which
-    # is where the name column normally sits in a Hebrew sheet.
-    chosen = max(cells, key=lambda cell: (sum(len(t) for _, t in cell),
-                                          max(w.right for w, _ in cell)))
-
-    parts = [t for _, t in chosen][:4]
-    confs = [w.conf for w, _ in chosen]
-
-    name = " ".join(parts)
-    raw_conf = int(round(np.mean(confs + [phone_conf])))
-    confidence = raw_conf
-    if len(cells) > 1:
-        # more than one Hebrew column means we had to guess which is the name —
-        # flag the row for a human, but don't let that penalty make the OCR pass
-        # itself look bad, or we'd never stop retrying a perfectly good read
-        confidence = min(confidence, 68)
-    return Contact(name=name, phone=phone, confidence=confidence,
-                   raw_conf=raw_conf, row_text=" ".join(w.text for w in row))
+    rightmost = cells[0]                       # row is already right-to-left
+    name = " ".join(text for _, text in rightmost[:4])
+    conf = float(np.mean([w.conf for w, _ in rightmost]))
+    return name, conf
 
 
-def good_enough(found: list[Contact]) -> bool:
-    """Stop early on a solid read. Judged on raw OCR confidence, not the
-    displayed one, and on the median so a single bad row doesn't force a
-    retry that costs another 30 seconds."""
-    if len(found) < 3:
-        return False
-    return float(np.median([c.raw_conf for c in found])) >= 72
+# --------------------------------------------------------------------------
+# Orchestration
+# --------------------------------------------------------------------------
+
+def load_image(data: bytes) -> np.ndarray:
+    try:
+        pil = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("L")
+    except Exception as exc:
+        raise HTTPException(400, f"Could not read that image: {exc}") from exc
+    gray = np.array(pil)
+    if gray.shape[1] > MAX_SOURCE_WIDTH:
+        f = MAX_SOURCE_WIDTH / gray.shape[1]
+        gray = cv2.resize(gray, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
+    return gray
 
 
-def extract_contacts(img: np.ndarray) -> tuple[list[Contact], str]:
-    """Try OCR passes in order of expected value, stopping when the result is
-    good enough or the time budget is spent — whichever comes first."""
+def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
     started = time.monotonic()
-    sharp = prepare_base(img)
-    cache: dict[str, np.ndarray] = {}
+    H, W = source.shape
+    info: dict = {"width": W, "height": H}
 
-    best: list[Contact] = []
-    best_label = "none"
+    # --- stage 1 -----------------------------------------------------------
+    f = min(1.0, LOCATE_WIDTH / W)
+    locate_img = (source if f == 1.0 else
+                  cv2.resize(source, None, fx=f, fy=f, interpolation=cv2.INTER_AREA))
+    hits = locate_phones(locate_img)
+    info["located"] = len(hits)
+    log.info("stage 1 located %d phone-shaped cells in %.1fs", len(hits),
+             time.monotonic() - started)
 
-    for index, (label, psm) in enumerate(PASSES):
-        elapsed = time.monotonic() - started
-        if index and elapsed > TIME_BUDGET_SECONDS:
-            log.info("time budget spent after %.1fs, returning %d contacts",
-                     elapsed, len(best))
+    if len(hits) < 2:
+        info["reason"] = "no phone column found"
+        return [], info
+
+    for w in hits:                                   # back to source coordinates
+        w.x, w.width = int(w.x / f), int(w.width / f)
+        w.y, w.height = w.y / f, int(w.height / f)
+
+    ys = sorted(w.y for w in hits)
+    row_height = float(np.median(np.diff(ys))) if len(ys) > 2 else hits[0].height * 2
+    row_height = max(row_height, hits[0].height * 1.2)
+    # Pad generously. The wide pass routinely misses the first and last rows,
+    # and if the crop stops at the last row it found, the high-resolution pass
+    # can never recover them. Rows above the table have no phone number in them,
+    # so over-reaching costs nothing.
+    pad = row_height * 3
+    rows_top = max(0, int(min(ys) - pad))
+    rows_bottom = min(H, int(max(ys) + pad))
+    scale = float(np.clip(TARGET_TEXT_PX / max(6.0, row_height * 0.5), 1.0, 3.0))
+    band = phone_band(hits, W)
+    info.update({"row_height": round(row_height, 1), "scale": round(scale, 2),
+                 "band": list(band)})
+
+    # --- stage 2 -----------------------------------------------------------
+    # Neither pass dominates: on one test photo the wide pass found 25 rows and
+    # the strip 8; on another the strip found 19 and the wide 15. So keep both
+    # and let them vote per row. The strip gets a small bonus because when the
+    # two disagree it has the resolution advantage — it corrected a wrong final
+    # digit the wide pass produced.
+    t = time.monotonic()
+    strip = read_phone_column(source, band, rows_top, rows_bottom, scale)
+    log.info("stage 2 read %d phones from the column strip in %.1fs",
+             len(strip), time.monotonic() - t)
+
+    candidates = [(w.y, normalize_phone(w.text) or "", w.conf) for w in hits]
+    candidates += [(y, phone, conf + 8) for y, phone, conf in strip]
+
+    by_row: dict[int, tuple[float, str, float]] = {}
+    for y, phone, conf in candidates:
+        if not phone:
+            continue
+        key = round(y / (row_height * 0.5))
+        if key not in by_row or conf > by_row[key][2]:
+            by_row[key] = (y, phone, conf)
+    phones = sorted(by_row.values())
+    info["rows_matched"] = len(phones)
+
+    if not phones:
+        info["reason"] = "phone column unreadable"
+        return [], info
+
+    # --- stage 3 -----------------------------------------------------------
+    # The name sits at the far right of a right-to-left sheet, so try a narrow
+    # right-hand slice first — it's a third of the pixels and excludes most of
+    # the other Hebrew columns. Widen to everything right of the phone column
+    # only if that comes back empty.
+    narrow_left = int(W - 0.45 * (W - band[1]))
+    names: list[Word] = []
+    for attempt, left in enumerate((narrow_left, band[1])):
+        if time.monotonic() - started > TIME_BUDGET_SECONDS:
+            log.warning("skipped name pass — out of time budget")
+            break
+        t = time.monotonic()
+        names, _, _ = read_name_area(source, left, rows_top, rows_bottom, scale)
+        log.info("stage 3 (attempt %d, x>=%d) read %d Hebrew words in %.1fs",
+                 attempt + 1, left, len(names), time.monotonic() - t)
+        if names:
             break
 
-        if label not in cache:
-            cache[label] = make_variant(sharp, label)
+    name_rows = group_rows(names, tolerance=row_height * 0.45)
 
-        pass_start = time.monotonic()
-        try:
-            rows = group_rows(ocr_words(cache[label], psm))
-        except pytesseract.TesseractError as exc:
-            log.warning("tesseract failed on %s/psm%s: %s", label, psm, exc)
-            continue
+    # --- pair by vertical position ----------------------------------------
+    contacts: dict[str, Contact] = {}
+    for y, phone, phone_conf in sorted(phones, key=lambda p: p[0]):
+        best_row, best_gap = None, row_height * 0.6
+        for row in name_rows:
+            gap = abs(row[0].y - y)
+            if gap < best_gap:
+                best_row, best_gap = row, gap
 
-        found = [c for c in (contact_from_row(r) for r in rows) if c]
+        name, name_conf = ("", 40.0)
+        if best_row:
+            got = name_from_row(best_row)
+            if got:
+                name, name_conf = got
 
-        # de-duplicate on the phone number, keeping the surest reading
-        by_phone: dict[str, Contact] = {}
-        for c in found:
-            if c.phone not in by_phone or c.raw_conf > by_phone[c.phone].raw_conf:
-                by_phone[c.phone] = c
-        found = list(by_phone.values())
+        confidence = int(round((phone_conf + name_conf) / 2)) if name else 45
+        existing = contacts.get(phone)
+        if existing is None or confidence > existing.confidence:
+            contacts[phone] = Contact(name=name, phone=phone, confidence=confidence)
 
-        log.info("pass %s/psm%d: %d contacts in %.1fs",
-                 label, psm, len(found), time.monotonic() - pass_start)
-
-        if (len(found), sum(c.raw_conf for c in found)) > \
-           (len(best), sum(c.raw_conf for c in best)):
-            best, best_label = found, f"{label}/psm{psm}"
-
-        if good_enough(best):
-            return best, best_label
-
-    return best, best_label
+    info["seconds"] = round(time.monotonic() - started, 1)
+    return list(contacts.values()), info
 
 
 # --------------------------------------------------------------------------
@@ -404,10 +445,9 @@ async def extract(image: UploadFile = File(...)) -> dict:
         raise HTTPException(413, "That image is larger than 12 MB.")
 
     started = time.monotonic()
-    img = resize_to_work(load_image(data))
-    contacts, method = extract_contacts(img)
+    contacts, info = extract_contacts(load_image(data))
     seconds = round(time.monotonic() - started, 1)
-    log.info("extracted %d contacts using %s in %.1fs", len(contacts), method, seconds)
+    log.info("extracted %d contacts in %.1fs %s", len(contacts), seconds, info)
 
     return {
         "contacts": [
@@ -415,8 +455,8 @@ async def extract(image: UploadFile = File(...)) -> dict:
             for c in contacts
         ],
         "count": len(contacts),
-        "method": method,
         "seconds": seconds,
+        "debug": info,
     }
 
 
