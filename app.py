@@ -9,32 +9,37 @@ Reading the whole photo at once fails: the table is a fraction of the frame,
 so the row text lands around 12px tall and Tesseract needs roughly 30px. And
 a page-wide read has to guess at a multi-column layout it can't see.
 
-So this works in three stages instead, each measured against real photos:
+Both columns therefore get the same treatment — locate, then crop and enlarge
+that one column and read it alone:
 
-  1. LOCATE  — cheap pass over a downscaled copy, digits only, to find where
-               the phone column sits and where the data rows are.
-  2. PHONES  — re-read that one column, cropped from the full-resolution
-               original and enlarged. On a test sheet this went from 15 of 20
-               rows to 19 of 20, and corrected a digit the wide pass got wrong.
-  3. NAMES   — read only the area to the right of the phone column, cropped
-               to the rows found in stage 1.
+  1. LOCATE PHONES — cheap pass over a downscaled copy, digits only, to find
+                     where the phone column sits and where the data rows are.
+  2. READ PHONES   — re-read that column, cropped from the full-resolution
+                     original and enlarged. On a test sheet this went from 15
+                     of 20 rows to 19 of 20 and corrected a wrong digit.
+  3. LOCATE NAMES  — find the "שם מלא" heading and take its column band. If the
+                     heading can't be read, fall back to the band occupied by
+                     the rightmost Hebrew cell of each data row.
+  4. READ NAMES    — read that band alone, cropped and enlarged.
 
 Then the two are paired by vertical position.
 
-Two findings drove the shape of this, both contrary to the obvious approach:
+Findings that drove this, all contrary to the obvious approach:
 
   * Plain grayscale beats denoise + CLAHE + unsharp masking. At this text size
     the filtering erased thin strokes: 25 phones found versus 7 on the same
     photo. There is no preprocessing chain here on purpose.
-  * PSM 11 (sparse text) beats PSM 6 (uniform block) roughly fourfold. A
-    spreadsheet is not a block of prose, and telling Tesseract it is makes it
-    force text into a layout that isn't there.
+  * PSM 11 (sparse text) beats PSM 6 (uniform block) roughly fourfold when
+    scanning a whole page — a spreadsheet is not a block of prose. But once a
+    single column has been cropped out, it IS a uniform block, and PSM 6 wins.
+  * An isolated column strip vastly outperforms reading a multi-column region,
+    which is why stages 3 and 4 mirror stages 1 and 2 rather than reading the
+    whole right-hand side of the sheet at once.
 
-Why the name is taken as the rightmost Hebrew cell in a row: these sheets are
-right-to-left, so the name column sits at or near column A, and every other
-Hebrew column (role, unit, rank, status, notes) falls to its left. Picking the
-longest or most confident Hebrew cell instead reliably picks a role like
-"לוחם ימי גברים" over the actual name.
+Why the name column sits at the right: these sheets are right-to-left, so
+"שם מלא" is column A or B and every other Hebrew column (role, unit, rank,
+status, notes) falls to its left. Picking the longest or most confident Hebrew
+cell instead reliably picks a role like "לוחם ימי גברים" over the actual name.
 """
 
 from __future__ import annotations
@@ -63,16 +68,23 @@ log = logging.getLogger("extractor")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
 
 MAX_UPLOAD_BYTES = 12 * 1024 * 1024
-MAX_SOURCE_WIDTH = 4000      # cap the original, for memory
-LOCATE_WIDTH = 1800          # the cheap first pass runs here
-TARGET_TEXT_PX = 30          # Tesseract's comfort zone for letter height
-MAX_CROP_PIXELS = 3_000_000  # ceiling on any single enlarged crop
+MAX_SOURCE_WIDTH = 4000       # cap the original, for memory
+LOCATE_WIDTH = 1800           # the cheap first pass runs here
+TARGET_DIGIT_PX = 30          # Tesseract's comfort zone for digit height
+TARGET_NAME_PX = 36           # Hebrew letters are denser; give them more room
+MAX_CROP_PIXELS = 3_000_000   # ceiling on any single enlarged crop
 
 TIME_BUDGET_SECONDS = float(os.getenv("TIME_BUDGET_SECONDS", "55"))
 
-HEBREW = re.compile(r"[\u05D0-\u05EA]")
-NON_NAME = re.compile(r"[^\u05D0-\u05EA\u0027\u0022\s\-׳״]")
+NAME_LANG = os.getenv("NAME_LANG", "heb")
 DIGITS_ONLY = "0123456789-"
+
+# Overridable so the column-finding logic can be exercised without Hebrew
+# traineddata installed.
+LETTERS = re.compile(os.getenv("LETTER_CLASS", r"[\u05D0-\u05EA]"))
+NON_NAME = re.compile(os.getenv("NON_NAME_CLASS",
+                                r"[^\u05D0-\u05EA\u0027\u0022\s\-׳״]"))
+NAME_HEADER = re.compile(os.getenv("NAME_HEADER", r"מלא|^שם$"))
 
 # Column headings and stock cell values that are never a person's name.
 NOT_A_NAME = {
@@ -82,7 +94,7 @@ NOT_A_NAME = {
     "מתחקר", "המתחקר", "שבוע", "בדיקה", "התייצבות", "במגן",
 }
 
-app = FastAPI(title="Hebrew contact extractor", version="2.0")
+app = FastAPI(title="Hebrew contact extractor", version="3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -177,6 +189,34 @@ def group_rows(words: list[Word], tolerance: float) -> list[list[Word]]:
     return rows
 
 
+def split_cells(row: list[Word]) -> list[list[Word]]:
+    """Split a row into cells. Words a space apart belong together; a gap of
+    more than about 1.6 line-heights means a new column."""
+    if not row:
+        return []
+    gap_limit = float(np.median([w.height for w in row])) * 1.6
+    cells = [[row[0]]]
+    for prev, current in zip(row, row[1:]):
+        if prev.x - current.right > gap_limit:
+            cells.append([current])
+        else:
+            cells[-1].append(current)
+    return cells
+
+
+def clean_name(cell: list[Word]) -> tuple[str, float] | None:
+    parts, confs = [], []
+    for w in cell:
+        cleaned = NON_NAME.sub("", w.text).strip()
+        if len(cleaned) < 2 or cleaned in NOT_A_NAME:
+            continue
+        parts.append(cleaned)
+        confs.append(w.conf)
+    if not parts:
+        return None
+    return " ".join(parts[:4]), float(np.mean(confs))
+
+
 # --------------------------------------------------------------------------
 # Stage 1 — locate the phone column
 # --------------------------------------------------------------------------
@@ -184,11 +224,8 @@ def group_rows(words: list[Word], tolerance: float) -> list[list[Word]]:
 def locate_phones(gray: np.ndarray) -> list[Word]:
     """Cheap wide pass, digits only. We don't trust the numbers it returns —
     only where on the page they are."""
-    found = []
-    for word in read_words(gray, psm=11, lang="eng", whitelist=DIGITS_ONLY):
-        if normalize_phone(word.text):
-            found.append(word)
-    return found
+    return [w for w in read_words(gray, psm=11, lang="eng", whitelist=DIGITS_ONLY)
+            if normalize_phone(w.text)]
 
 
 def phone_band(hits: list[Word], page_width: int) -> tuple[int, int]:
@@ -213,11 +250,11 @@ def phone_band(hits: list[Word], page_width: int) -> tuple[int, int]:
 # --------------------------------------------------------------------------
 
 def read_phone_column(source: np.ndarray, band: tuple[int, int],
-                      rows_top: int, rows_bottom: int,
+                      top: int, bottom: int,
                       scale: float) -> list[tuple[float, str, float]]:
     """Returns (y in source coordinates, phone, confidence)."""
     x0, x1 = band
-    crop = source[rows_top:rows_bottom, x0:x1]
+    crop = source[top:bottom, x0:x1]
     if crop.size == 0:
         return []
     enlarged, applied = enlarge(crop, scale)
@@ -226,72 +263,164 @@ def read_phone_column(source: np.ndarray, band: tuple[int, int],
     for word in read_words(enlarged, psm=11, lang="eng", whitelist=DIGITS_ONLY):
         phone = normalize_phone(word.text)
         if phone:
-            out.append((rows_top + word.y / applied, phone, word.conf))
+            out.append((top + word.y / applied, phone, word.conf))
     return out
 
 
 # --------------------------------------------------------------------------
-# Stage 3 — read the names
+# Stage 3 — find the name column
 # --------------------------------------------------------------------------
 
-def read_name_area(source: np.ndarray, left: int, rows_top: int,
-                   rows_bottom: int, scale: float) -> tuple[list[Word], float, int]:
-    """Everything to the right of the phone column, limited to the data rows.
-    Returns words in source coordinates."""
-    crop = source[rows_top:rows_bottom, left:]
+def survey_names(source: np.ndarray, left: int, top: int, bottom: int,
+                 scale: float) -> list[Word]:
+    """Wide-ish pass over the right-hand side, including the heading row, to
+    work out where the name column is. Sparse mode, because this region still
+    holds several columns."""
+    crop = source[top:bottom, left:]
     if crop.size == 0:
-        return [], 1.0, left
+        return []
+    enlarged, applied = enlarge(crop, scale)
+    try:
+        words = read_words(enlarged, psm=11, lang=NAME_LANG)
+    except pytesseract.TesseractError as exc:
+        log.error("name survey failed: %s", exc)
+        return []
+
+    for w in words:
+        w.x = int(left + w.x / applied)
+        w.width = int(w.width / applied)
+        w.y = top + w.y / applied
+        w.height = int(w.height / applied)
+    return [w for w in words if LETTERS.search(w.text)]
+
+
+def band_from_header(words: list[Word], row_height: int,
+                     page_width: int) -> tuple[int, int] | None:
+    """Find the "שם מלא" heading and return its column's horizontal extent.
+
+    This is the most reliable signal available: the sheet labels its own
+    columns, so we read the label instead of inferring the layout.
+    """
+    for word in words:
+        if not NAME_HEADER.search(word.text):
+            continue
+        siblings = [w for w in words if abs(w.y - word.y) <= row_height * 0.45]
+        for cell in split_cells(sorted(siblings, key=lambda w: -w.x)):
+            if word not in cell:
+                continue
+            left = min(w.x for w in cell)
+            right = max(w.right for w in cell)
+            pad = (right - left) * 0.25
+            band = (max(2, int(left - pad)), min(page_width - 2, int(right + pad)))
+            if 0.03 * page_width < band[1] - band[0] < 0.45 * page_width:
+                return band
+    return None
+
+
+def widen_to_content(anchor: tuple[int, int], words: list[Word],
+                     row_height: float, page_width: int) -> tuple[int, int]:
+    """
+    Grow a band derived from a heading until it covers the cells beneath it.
+
+    A heading label is usually narrower than its column — "שם מלא" is shorter
+    than most full names — so cropping to the label alone slices the ends off
+    long entries. The heading tells us WHICH column; the rows tell us how wide
+    it really is. Percentiles rather than extremes, so one row that reads badly
+    can't stretch the band into the neighbouring column.
+    """
+    lefts, rights = [], []
+    for row in group_rows(words, tolerance=row_height * 0.45):
+        for cell in split_cells(row):
+            left = min(w.x for w in cell)
+            right = max(w.right for w in cell)
+            if right > anchor[0] and left < anchor[1]:      # overlaps the heading
+                lefts.append(left)
+                rights.append(right)
+                break
+
+    if len(lefts) < 3:
+        return anchor
+
+    left = float(np.percentile(lefts, 5))
+    right = float(np.percentile(rights, 95))
+    pad = (right - left) * 0.08
+    return (max(2, int(min(left - pad, anchor[0]))),
+            min(page_width - 2, int(max(right + pad, anchor[1]))))
+
+
+def band_from_rows(words: list[Word], row_height: float,
+                   page_width: int) -> tuple[int, int] | None:
+    """Fallback when the heading can't be read: the rightmost cell of each data
+    row. Medians, not extremes, so one row that reads badly can't stretch the
+    band across neighbouring columns."""
+    lefts, rights = [], []
+    for row in group_rows(words, tolerance=row_height * 0.45):
+        cells = split_cells(row)
+        if not cells:
+            continue
+        rightmost = cells[0]
+        if clean_name(rightmost):
+            lefts.append(min(w.x for w in rightmost))
+            rights.append(max(w.right for w in rightmost))
+
+    if len(lefts) < 3:
+        return None
+    left, right = float(np.median(lefts)), float(np.median(rights))
+    pad = (right - left) * 0.3
+    return (max(2, int(left - pad)), min(page_width - 2, int(right + pad)))
+
+
+# --------------------------------------------------------------------------
+# Stage 4 — read the name column on its own
+# --------------------------------------------------------------------------
+
+def read_name_column(source: np.ndarray, band: tuple[int, int],
+                     top: int, bottom: int,
+                     scale: float) -> list[Word]:
+    """One column, cropped and enlarged. Now that it really is a single block
+    of text, PSM 6 applies — and it beats sparse mode here."""
+    x0, x1 = band
+    crop = source[top:bottom, x0:x1]
+    if crop.size == 0:
+        return []
     enlarged, applied = enlarge(crop, scale)
 
     best: list[Word] = []
-    for psm in (11, 6):
+    for psm in (6, 4, 11):
         try:
-            words = read_words(enlarged, psm=psm, lang="heb+eng")
+            words = read_words(enlarged, psm=psm, lang=NAME_LANG)
         except pytesseract.TesseractError as exc:
-            # Missing Hebrew traineddata, most likely. Phones are still good,
-            # so return what we have rather than failing the whole request.
-            log.error("Hebrew OCR failed (psm %d): %s", psm, exc)
-            return [], 1.0, left
-        hebrew = [w for w in words if HEBREW.search(w.text)]
-        if len(hebrew) > len(best):
-            best = hebrew
-        if len(best) >= 8:
+            log.error("name column read failed (psm %d): %s", psm, exc)
+            return []
+        keep = [w for w in words if LETTERS.search(w.text)]
+        if len(keep) > len(best):
+            best = keep
+        if len(best) >= 5:
             break
 
     for w in best:
-        w.x = int(left + w.x / applied)
+        w.x = int(x0 + w.x / applied)
         w.width = int(w.width / applied)
-        w.y = rows_top + w.y / applied
+        w.y = top + w.y / applied
         w.height = int(w.height / applied)
-    return best, applied, left
+    return best
 
 
-def name_from_row(row: list[Word]) -> tuple[str, float] | None:
-    """The rightmost Hebrew cell in the row. Words a space apart are one cell;
-    a wide gap means a new column."""
-    cells: list[list[Word]] = []
-    usable = []
-    for w in row:
-        cleaned = NON_NAME.sub("", w.text).strip()
-        if len(cleaned) < 2 or cleaned in NOT_A_NAME:
+def names_by_row(words: list[Word], row_height: float,
+                 bonus: float = 0.0) -> dict[int, tuple[float, str, float]]:
+    out: dict[int, tuple[float, str, float]] = {}
+    for row in group_rows(words, tolerance=row_height * 0.45):
+        cells = split_cells(row)
+        if not cells:
             continue
-        usable.append((w, cleaned))
-
-    if not usable:
-        return None
-
-    gap_limit = float(np.median([w.height for w, _ in usable])) * 1.6
-    cells = [[usable[0]]]
-    for prev, current in zip(usable, usable[1:]):
-        if prev[0].x - current[0].right > gap_limit:
-            cells.append([current])
-        else:
-            cells[-1].append(current)
-
-    rightmost = cells[0]                       # row is already right-to-left
-    name = " ".join(text for _, text in rightmost[:4])
-    conf = float(np.mean([w.conf for w, _ in rightmost]))
-    return name, conf
+        got = clean_name(cells[0])          # rightmost cell in the row
+        if not got:
+            continue
+        name, conf = got
+        key = round(row[0].y / (row_height * 0.5))
+        if key not in out or conf + bonus > out[key][2]:
+            out[key] = (row[0].y, name, conf + bonus)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -315,7 +444,7 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
     H, W = source.shape
     info: dict = {"width": W, "height": H}
 
-    # --- stage 1 -----------------------------------------------------------
+    # --- stage 1: locate the phone column ---------------------------------
     f = min(1.0, LOCATE_WIDTH / W)
     locate_img = (source if f == 1.0 else
                   cv2.resize(source, None, fx=f, fy=f, interpolation=cv2.INTER_AREA))
@@ -335,26 +464,25 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
     ys = sorted(w.y for w in hits)
     row_height = float(np.median(np.diff(ys))) if len(ys) > 2 else hits[0].height * 2
     row_height = max(row_height, hits[0].height * 1.2)
+
     # Pad generously. The wide pass routinely misses the first and last rows,
     # and if the crop stops at the last row it found, the high-resolution pass
-    # can never recover them. Rows above the table have no phone number in them,
-    # so over-reaching costs nothing.
+    # can never recover them.
     pad = row_height * 3
     rows_top = max(0, int(min(ys) - pad))
     rows_bottom = min(H, int(max(ys) + pad))
-    scale = float(np.clip(TARGET_TEXT_PX / max(6.0, row_height * 0.5), 1.0, 3.0))
+    digit_scale = float(np.clip(TARGET_DIGIT_PX / max(6.0, row_height * 0.5), 1.0, 3.0))
+    name_scale = float(np.clip(TARGET_NAME_PX / max(6.0, row_height * 0.5), 1.0, 3.5))
     band = phone_band(hits, W)
-    info.update({"row_height": round(row_height, 1), "scale": round(scale, 2),
-                 "band": list(band)})
+    info.update({"row_height": round(row_height, 1), "phone_band": list(band)})
 
-    # --- stage 2 -----------------------------------------------------------
+    # --- stage 2: read the phone column -----------------------------------
     # Neither pass dominates: on one test photo the wide pass found 25 rows and
     # the strip 8; on another the strip found 19 and the wide 15. So keep both
     # and let them vote per row. The strip gets a small bonus because when the
-    # two disagree it has the resolution advantage — it corrected a wrong final
-    # digit the wide pass produced.
+    # two disagree it has the resolution advantage.
     t = time.monotonic()
-    strip = read_phone_column(source, band, rows_top, rows_bottom, scale)
+    strip = read_phone_column(source, band, rows_top, rows_bottom, digit_scale)
     log.info("stage 2 read %d phones from the column strip in %.1fs",
              len(strip), time.monotonic() - t)
 
@@ -375,40 +503,54 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
         info["reason"] = "phone column unreadable"
         return [], info
 
-    # --- stage 3 -----------------------------------------------------------
-    # The name sits at the far right of a right-to-left sheet, so try a narrow
-    # right-hand slice first — it's a third of the pixels and excludes most of
-    # the other Hebrew columns. Widen to everything right of the phone column
-    # only if that comes back empty.
-    narrow_left = int(W - 0.45 * (W - band[1]))
-    names: list[Word] = []
-    for attempt, left in enumerate((narrow_left, band[1])):
-        if time.monotonic() - started > TIME_BUDGET_SECONDS:
-            log.warning("skipped name pass — out of time budget")
-            break
-        t = time.monotonic()
-        names, _, _ = read_name_area(source, left, rows_top, rows_bottom, scale)
-        log.info("stage 3 (attempt %d, x>=%d) read %d Hebrew words in %.1fs",
-                 attempt + 1, left, len(names), time.monotonic() - t)
-        if names:
-            break
+    # --- stage 3: locate the name column ----------------------------------
+    names: dict[int, tuple[float, str, float]] = {}
+    name_band = None
 
-    name_rows = group_rows(names, tolerance=row_height * 0.45)
+    if time.monotonic() - started < TIME_BUDGET_SECONDS:
+        t = time.monotonic()
+        # start above the data rows so the heading row is inside the crop
+        survey_top = max(0, int(rows_top - row_height * 2))
+        survey = survey_names(source, band[1], survey_top, rows_bottom, digit_scale)
+        name_band = band_from_header(survey, row_height, W)
+        if name_band:
+            info["band_source"] = "header"
+            name_band = widen_to_content(name_band, survey, row_height, W)
+        else:
+            name_band = band_from_rows(survey, row_height, W)
+            info["band_source"] = "rows" if name_band else "none"
+        log.info("stage 3 surveyed %d words, name band %s (%s) in %.1fs",
+                 len(survey), name_band, info.get("band_source"),
+                 time.monotonic() - t)
+        # whatever the survey already read is a usable fallback per row
+        names = names_by_row([w for w in survey
+                              if name_band is None
+                              or name_band[0] - row_height <= w.x <= name_band[1] + row_height],
+                             row_height)
+
+    # --- stage 4: read the name column on its own -------------------------
+    if name_band and time.monotonic() - started < TIME_BUDGET_SECONDS:
+        t = time.monotonic()
+        column = read_name_column(source, name_band, rows_top, rows_bottom, name_scale)
+        log.info("stage 4 read %d words from the name column in %.1fs",
+                 len(column), time.monotonic() - t)
+        for key, value in names_by_row(column, row_height, bonus=8).items():
+            if key not in names or value[2] > names[key][2]:
+                names[key] = value
+
+    info["names_found"] = len(names)
+    info["name_band"] = list(name_band) if name_band else None
 
     # --- pair by vertical position ----------------------------------------
+    name_rows = sorted(names.values())
     contacts: dict[str, Contact] = {}
-    for y, phone, phone_conf in sorted(phones, key=lambda p: p[0]):
-        best_row, best_gap = None, row_height * 0.6
-        for row in name_rows:
-            gap = abs(row[0].y - y)
+    for y, phone, phone_conf in phones:
+        name, name_conf = "", 40.0
+        best_gap = row_height * 0.6
+        for ny, candidate, conf in name_rows:
+            gap = abs(ny - y)
             if gap < best_gap:
-                best_row, best_gap = row, gap
-
-        name, name_conf = ("", 40.0)
-        if best_row:
-            got = name_from_row(best_row)
-            if got:
-                name, name_conf = got
+                name, name_conf, best_gap = candidate, conf, gap
 
         confidence = int(round((phone_conf + name_conf) / 2)) if name else 45
         existing = contacts.get(phone)
