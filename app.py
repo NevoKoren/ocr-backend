@@ -57,6 +57,7 @@ import numpy as np
 import pytesseract
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from PIL import Image, ImageOps
 
 logging.basicConfig(level=logging.INFO)
@@ -913,6 +914,11 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
 
         info["page_read"] = how
         info["page_conf"] = round(page_conf)
+        # a readable transcript of what Tesseract saw, for the debug report
+        transcript = []
+        for row in group_rows(page_words, row_height * 0.45):
+            transcript.append(" ".join(w.text for w in row))
+        info["raw_text"] = "\n".join(transcript)[:4000]
         log.info("stage 3 read the page (%s): %d words, %d columns, band %s (%s) in %.1fs",
                  how, len(page), len(detect_columns(page, W, row_height)), name_band,
                  info.get("band_source"), time.monotonic() - t)
@@ -1034,6 +1040,94 @@ def health() -> dict:
         "status": "ok",
         "tesseract": str(pytesseract.get_tesseract_version()),
         "hebrew_installed": "heb" in langs,
+    }
+
+
+def iso_to_dmy(iso: str) -> str:
+    """2026-08-04 -> 04/08/2026.
+
+    The consuming site parses dates with convertOcrDateToISO, which splits on
+    the separator and reads day-month-year in that order. Handing it an ISO
+    string would silently produce nonsense, so the old day-first format is
+    what goes back over this endpoint.
+    """
+    try:
+        year, month, day = iso.split("-")
+        return f"{int(day):02d}/{int(month):02d}/{year}"
+    except (ValueError, AttributeError):
+        return ""
+
+
+def pretty_phone(digits: str) -> str:
+    return f"{digits[:3]}-{digits[3:]}" if len(digits) == 10 else digits
+
+
+@app.post("/upload/")
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)) -> dict:
+    """
+    Compatibility endpoint for the interview-scheduling site.
+
+    That site already posts here, so rather than editing a working app this
+    endpoint returns exactly the shape it expects: a "file" field on the way
+    in, status/data/debug on the way out, dates day-first, and "-" rather than
+    an empty string for anything that wasn't found. The debug block carries the
+    keys its console report reads, so nothing there throws.
+    """
+    data = await file.read()
+    if not data:
+        return JSONResponse(status_code=400,
+                            content={"status": "error", "message": "לא התקבלה תמונה."})
+    if len(data) > MAX_UPLOAD_BYTES:
+        return JSONResponse(status_code=413,
+                            content={"status": "error", "message": "התמונה גדולה מ-12MB."})
+
+    try:
+        source = load_image(data)
+        contacts, info = extract_contacts(source)
+    except HTTPException as exc:
+        return JSONResponse(status_code=400,
+                            content={"status": "error", "message": str(exc.detail)})
+    except Exception as exc:                       # noqa: BLE001
+        log.exception("upload failed")
+        return JSONResponse(status_code=500,
+                            content={"status": "error", "message": str(exc)[:200]})
+
+    sheet_date = info.get("date", "")
+    rows, lines = [], []
+    for index, c in enumerate(contacts):
+        date_value = iso_to_dmy(c.date or sheet_date)
+        rows.append({
+            "name": c.name or "-",
+            "phone": pretty_phone(c.phone) or "-",
+            "date": date_value or "-",
+            "time": c.time or "-",
+            # not read by the site today, but it lets a row be held back for
+            # review instead of being messaged directly
+            "confidence": c.confidence,
+        })
+        lines.append({
+            "line_number": index + 1,
+            "action": "data_extraction",
+            "raw_line": f"{c.name} | {c.phone} | {c.date or sheet_date} | {c.time}",
+            "cells_detected": [c.name, c.phone, date_value, c.time],
+            "selected_name_cell": c.name,
+            "cleaned_name": c.name,
+            "phone_matched": c.phone,
+            "date_matched": date_value,
+            "time_matched": c.time,
+        })
+
+    log.info("upload: returned %d rows to the scheduling site", len(rows))
+    return {
+        "status": "success",
+        "data": rows,
+        "debug": {
+            "raw_ocr_output": info.get("raw_text", ""),
+            "detected_name_index": info.get("name_band", [-1])[0] if info.get("name_band") else -1,
+            "lines_processing": lines,
+            "extractor": info,
+        },
     }
 
 
