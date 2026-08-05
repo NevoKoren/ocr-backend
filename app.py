@@ -523,12 +523,18 @@ def read_name_column(source: np.ndarray, band: tuple[int, int],
     """
     One column, cropped and enlarged, read several ways.
 
-    Measured on a degraded fixture at 10px letter height: plain grayscale
-    scored 20/25 and a mild unsharp mask 22/25, while CLAHE dropped to 14 and
-    Otsu to 15 — so the heavy filtering that helps scanned documents is
-    deliberately absent. The Hebrew-only and gridline-removal variants could
-    not be measured here for lack of Hebrew traineddata; /diagnose settles
-    which of them wins on a real sheet.
+    Gridline removal comes first because it decides everything here. Measured
+    on a real sheet at 11px letters: with the rules removed, 42 words at
+    confidence 72 and 19 of 20 rows named; without them, on the identical crop,
+    7 words at confidence 19 and 4 rows.
+
+    The reason is that this crop gets enlarged ~2.8x, and that enlarges the
+    cell borders along with the text — a thin rule becomes a thick black stroke
+    pressed against the letters beside it. Enlargement and rule removal only
+    work as a pair; either one alone measured worse than doing nothing.
+
+    A Hebrew-only character whitelist was also tried and made no difference at
+    all, so it is not in the default path.
     """
     x0, x1 = band
     crop = source[top:bottom, x0:x1]
@@ -537,8 +543,7 @@ def read_name_column(source: np.ndarray, band: tuple[int, int],
     enlarged, applied = enlarge(crop, scale)
 
     labels = ([FORCED_VARIANT] if FORCED_VARIANT in NAME_VARIANTS
-              else ["plain/psm6", "sharp/psm6", "plain/psm6/heb-only",
-                    "sharp/psm6/heb-only", "plain/psm11"])
+              else ["nolines/psm6", "plain/psm6", "sharp/psm6", "plain/psm11"])
 
     best: list[Word] = []
     best_score = (-1, 0.0)
@@ -706,33 +711,50 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
                  else names_by_row(page, row_height))
         info["names_from_page"] = len(names)
 
-    # --- stage 4: enlarged read, only when it's likely to help -------------
-    # Measured: at ~10px letters the enlarged crop beats the raw page 22 to 19;
-    # at 15px and above the raw page wins and enlarging costs accuracy. So this
-    # runs when the raw read came up short, or when the letters are small
-    # enough that enlarging has something to offer. The two are merged per row
-    # by confidence rather than one replacing the other.
-    # Confidence alone is not enough to skip the enlarged pass: on small text
-    # the raw read can be confidently wrong. Both signals have to agree.
-    page_was_good = (info.get("page_conf", 0) >= 65 and letter_px >= 14
-                     and len(names) >= 3)
-    if (name_band and not page_was_good and (len(names) < 3 or letter_px < 14)
-            and time.monotonic() - started < TIME_BUDGET_SECONDS):
+    # --- stage 4: read the name column as an isolated strip ----------------
+    # This costs about two seconds and on a real sheet beat the whole-page read
+    # 19 rows to 18 while being five times faster, so it always runs.
+    #
+    # The two sources are compared as sets rather than row by row. Row-by-row
+    # confidence merging was wrong: the page read reports slightly higher
+    # confidence, so it would win most rows individually even when the strip
+    # read was the better result overall. Whichever names more rows becomes the
+    # base, and the other only fills rows the base missed.
+    if name_band and time.monotonic() - started < TIME_BUDGET_SECONDS:
         t = time.monotonic()
         column_words = read_name_column(source, name_band, rows_top, rows_bottom,
                                         name_scale)
-        merged = 0
-        for key, value in names_by_row(column_words, row_height).items():
-            if value[2] < 45:
-                continue        # too unsure to be worth adding at all
-            # The enlarged read reports slightly higher confidence even when it
-            # is wrong, so it has to win by a real margin before it replaces a
-            # row the untouched read already produced.
-            if key not in names or value[2] > names[key][2] + 12:
-                names[key] = value
-                merged += 1
-        log.info("stage 4 enlarged read: %d words, %d rows improved, in %.1fs",
-                 len(column_words), merged, time.monotonic() - t)
+        strip_names = names_by_row(column_words, row_height)
+        log.info("stage 4 strip read: %d words, %d rows named, in %.1fs",
+                 len(column_words), len(strip_names), time.monotonic() - t)
+
+        # Row count alone can't separate these — both sources name nearly every
+        # row. What separates them is confidence: measured on one fixture the
+        # page named 25 rows with 17 correct at confidence 65, while the strip
+        # named 24 with 21 correct at confidence 90. So score each source by
+        # rows x confidence, roughly "expected correct rows", and let the
+        # winner be the base. The loser only fills rows the base missed.
+        def source_score(rows: dict) -> float:
+            if not rows:
+                return 0.0
+            return len(rows) * float(np.mean([v[2] for v in rows.values()]))
+
+        page_score, strip_score = source_score(names), source_score(strip_names)
+        pick = os.getenv("NAMES_SOURCE", "auto")
+        if pick == "strip" or (pick == "auto" and strip_score >= page_score):
+            base, filler, chosen = strip_names, names, "strip"
+        else:
+            base, filler, chosen = names, strip_names, "page"
+
+        info["names_source"] = chosen
+        log.info("  name source: page %.0f vs strip %.0f -> %s",
+                 page_score, strip_score, chosen)
+
+        merged = dict(base)
+        for key, value in filler.items():
+            if key not in merged and value[2] >= 45:
+                merged[key] = value
+        names = merged
 
     info["names_found"] = len(names)
     info["name_band"] = list(name_band) if name_band else None
