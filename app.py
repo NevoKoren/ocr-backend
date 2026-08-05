@@ -263,13 +263,15 @@ def phone_band(hits: list[Word], page_width: int) -> tuple[int, int]:
 # --------------------------------------------------------------------------
 
 def read_phone_column(source: np.ndarray, band: tuple[int, int],
-                      top: int, bottom: int,
-                      scale: float) -> list[tuple[float, str, float]]:
+                      top: int, bottom: int, scale: float,
+                      denoise: bool = False) -> list[tuple[float, str, float]]:
     """Returns (y in source coordinates, phone, confidence)."""
     x0, x1 = band
     crop = source[top:bottom, x0:x1]
     if crop.size == 0:
         return []
+    if denoise:
+        crop = cv2.medianBlur(crop, 5)
     enlarged, applied = enlarge(crop, scale)
 
     out: list[tuple[float, str, float]] = []
@@ -669,7 +671,8 @@ def find_date_column(page: list[Word], rows_top: int, rows_bottom: int,
 
 def read_time_column(source: np.ndarray, band: tuple[int, int], rows_top: int,
                      rows_bottom: int, row_height: float,
-                     already: list[Word]) -> list[tuple[float, str, float]]:
+                     already: list[Word],
+                     denoise: bool = False) -> list[tuple[float, str, float]]:
     """Re-read the time column with the charset pinned — the same treatment
     that makes the phone column reliable — and merge with what the page read
     already produced."""
@@ -678,6 +681,8 @@ def read_time_column(source: np.ndarray, band: tuple[int, int], rows_top: int,
     scale = float(np.clip(TARGET_DIGIT_PX / max(6.0, row_height * 0.5), 1.0, 3.0))
     crop = source[rows_top:rows_bottom, band[0]:band[1]]
     if crop.size:
+        if denoise:
+            crop = cv2.medianBlur(crop, 5)
         enlarged, applied = enlarge(remove_rules(crop), scale)
         try:
             for w in read_words(enlarged, psm=11, lang="eng",
@@ -721,8 +726,8 @@ def value_for_row(y: float, values: list[tuple[float, str, float]],
 
 
 def read_name_column(source: np.ndarray, band: tuple[int, int],
-                     top: int, bottom: int,
-                     scale: float) -> list[Word]:
+                     top: int, bottom: int, scale: float,
+                     denoise: bool = False) -> list[Word]:
     """
     One column, cropped and enlarged, read several ways.
 
@@ -743,6 +748,8 @@ def read_name_column(source: np.ndarray, band: tuple[int, int],
     crop = source[top:bottom, x0:x1]
     if crop.size == 0:
         return []
+    if denoise:
+        crop = cv2.medianBlur(crop, 5)
     enlarged, applied = enlarge(crop, scale)
 
     labels = ([FORCED_VARIANT] if FORCED_VARIANT in NAME_VARIANTS
@@ -834,6 +841,21 @@ def extract_contacts(source: np.ndarray,
                   cv2.resize(source, None, fx=f, fy=f, interpolation=cv2.INTER_AREA))
     step(8, "מאתר את הטבלה בתמונה")
     hits = locate_phones(locate_img)
+
+    if len(hits) < 3:
+        # A photo of an LCD can carry heavy moiré from the pixel grid, which
+        # breaks a 10-digit number into fragments. A median filter removes that
+        # interference without touching stroke shape.
+        #
+        # It runs only as a fallback because on a clean sheet it is destructive:
+        # measured across three working photos it took 15, 25 and 25 located
+        # cells down to 0. On the moiré sheet it took 1 up to 4.
+        retry = locate_phones(cv2.medianBlur(locate_img, 5))
+        log.info("locate pass found %d, moire retry found %d", len(hits), len(retry))
+        if len(retry) > len(hits):
+            hits = retry
+            info["locate_mode"] = "median"
+
     step(26, "קורא מספרי טלפון")
     for w in hits:                                   # back to source coordinates
         w.x, w.width = int(w.x / f), int(w.width / f)
@@ -876,7 +898,9 @@ def extract_contacts(source: np.ndarray,
     # and let them vote per row. The strip gets a small bonus because when the
     # two disagree it has the resolution advantage.
     t = time.monotonic()
-    strip = read_phone_column(source, band, rows_top, rows_bottom, digit_scale)
+    moire = info.get("locate_mode") == "median"
+    strip = read_phone_column(source, band, rows_top, rows_bottom, digit_scale,
+                              denoise=moire)
     step(38, "קורא את הדף במלואו")
     log.info("stage 2 read %d phones from the column strip in %.1fs",
              len(strip), time.monotonic() - t)
@@ -907,7 +931,9 @@ def extract_contacts(source: np.ndarray,
 
     if time.monotonic() - started < TIME_BUDGET_SECONDS:
         t = time.monotonic()
-        page, how, page_conf = read_page(source, TIME_BUDGET_SECONDS - (t - started))
+        # the same interference that broke the digits also breaks Hebrew
+        page_source = cv2.medianBlur(source, 5) if moire else source
+        page, how, page_conf = read_page(page_source, TIME_BUDGET_SECONDS - (t - started))
         step(72, "מאתר את עמודת השמות")
         page_words = page          # unfiltered, so the date banner above the table survives
 
@@ -965,7 +991,7 @@ def extract_contacts(source: np.ndarray,
         t = time.monotonic()
         step(80, "קורא שמות בעברית")
         column_words = read_name_column(source, name_band, rows_top, rows_bottom,
-                                        name_scale)
+                                        name_scale, denoise=moire)
         strip_names = names_by_row(column_words, row_height)
         log.info("stage 4 strip read: %d words, %d rows named, in %.1fs",
                  len(column_words), len(strip_names), time.monotonic() - t)
@@ -1018,7 +1044,7 @@ def extract_contacts(source: np.ndarray,
 
         if time_band:
             times = read_time_column(source, time_band, rows_top, rows_bottom,
-                                     row_height, time_hits)
+                                     row_height, time_hits, denoise=moire)
         if not times:
             # no column — the sheet may state a single time in a heading
             global_time = find_global_time(page_words, rows_top, row_height)
