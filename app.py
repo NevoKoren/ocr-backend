@@ -54,7 +54,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 import pytesseract
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageOps
 
@@ -149,7 +149,9 @@ def read_words(image: np.ndarray, psm: int, lang: str,
                whitelist: str | None = None) -> list[Word]:
     config = f"--oem 1 --psm {psm}"
     if whitelist:
-        config += f" -c tessedit_char_whitelist={whitelist}"
+        # Quoted: pytesseract splits the config with shlex, so an unquoted
+        # whitelist containing a space silently loses everything after it.
+        config += f' -c "tessedit_char_whitelist={whitelist}"'
     data = pytesseract.image_to_data(image, lang=lang, config=config,
                                      output_type=pytesseract.Output.DICT)
     words: list[Word] = []
@@ -460,39 +462,112 @@ def band_from_rows(words: list[Word], row_height: float,
 # Stage 4 — read the name column on its own
 # --------------------------------------------------------------------------
 
+# The name column contains Hebrew letters and nothing else. Constraining the
+# charset is the same trick that makes the phone column near-perfect: it strips
+# out every Latin and digit confusion before they can happen.
+# No quote characters here — pytesseract splits the config with shlex, so a
+# stray quote makes the whole call fail.
+HEBREW_ALPHABET = "אבגדהוזחטיכלמנסעפצקרשתךםןףץ -"
+
+
+def remove_rules(img: np.ndarray) -> np.ndarray:
+    """Erase the table's own gridlines.
+
+    A column strip carries a rule down each edge and one between every row,
+    and where a rule touches a letter Tesseract sees a different glyph. The
+    lines are found by morphological opening with a kernel far longer than any
+    letter stroke, then painted out by inpainting rather than whitening, so the
+    letter pixels a rule crosses get filled from their surroundings.
+    """
+    h, w = img.shape[:2]
+    if h < 8 or w < 8:
+        return img
+    inverted = 255 - img
+    binary = cv2.threshold(inverted, 0, 255,
+                           cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+    horizontal = cv2.morphologyEx(binary, cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (max(8, int(w * 0.5)), 1)))
+    vertical = cv2.morphologyEx(binary, cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(8, int(h * 0.25)))))
+    mask = cv2.dilate(cv2.bitwise_or(horizontal, vertical),
+                      np.ones((3, 3), np.uint8), iterations=1)
+    if not mask.any():
+        return img
+    return cv2.inpaint(img, mask, 3, cv2.INPAINT_TELEA)
+
+
+def sharpen(img: np.ndarray) -> np.ndarray:
+    return cv2.addWeighted(img, 1.5, cv2.GaussianBlur(img, (0, 0), 1.2), -0.5, 0)
+
+
+# label -> (preprocess, psm, whitelist)
+NAME_VARIANTS: dict[str, tuple[str, int, str | None]] = {
+    "plain/psm6":            ("plain",   6,  None),
+    "sharp/psm6":            ("sharp",   6,  None),
+    "plain/psm6/heb-only":   ("plain",   6,  HEBREW_ALPHABET),
+    "sharp/psm6/heb-only":   ("sharp",   6,  HEBREW_ALPHABET),
+    "nolines/psm6":          ("nolines", 6,  None),
+    "nolines/psm6/heb-only": ("nolines", 6,  HEBREW_ALPHABET),
+    "plain/psm4":            ("plain",   4,  None),
+    "plain/psm11":           ("plain",  11,  None),
+    "sharp/psm11/heb-only":  ("sharp",  11,  HEBREW_ALPHABET),
+}
+
+# Set NAME_VARIANT on the server to lock in one of the labels above once the
+# /diagnose sweep has shown which wins on real sheets.
+FORCED_VARIANT = os.getenv("NAME_VARIANT") or None
+
+
+def apply_prep(image: np.ndarray, mode: str) -> np.ndarray:
+    if mode == "sharp":
+        return sharpen(image)
+    if mode == "nolines":
+        return sharpen(remove_rules(image))
+    return image
+
+
 def read_name_column(source: np.ndarray, band: tuple[int, int],
                      top: int, bottom: int,
                      scale: float) -> list[Word]:
     """
-    One column, cropped and enlarged. Now that it really is a single block of
-    text, PSM 6 applies — and it beats sparse mode here.
+    One column, cropped and enlarged, read several ways.
 
-    Measured on a degraded fixture at 10px letter height (about what a distant
-    phone photo gives): plain grayscale scored 20/25 and a mild unsharp mask
-    22/25, while CLAHE dropped to 14 and Otsu to 15. So only those two variants
-    are tried, and the stronger filtering that helps scanned documents is
-    deliberately absent.
+    Measured on a degraded fixture at 10px letter height: plain grayscale
+    scored 20/25 and a mild unsharp mask 22/25, while CLAHE dropped to 14 and
+    Otsu to 15 — so the heavy filtering that helps scanned documents is
+    deliberately absent. The Hebrew-only and gridline-removal variants could
+    not be measured here for lack of Hebrew traineddata; /diagnose settles
+    which of them wins on a real sheet.
     """
     x0, x1 = band
     crop = source[top:bottom, x0:x1]
     if crop.size == 0:
         return []
     enlarged, applied = enlarge(crop, scale)
-    sharpened = cv2.addWeighted(enlarged, 1.5,
-                                cv2.GaussianBlur(enlarged, (0, 0), 1.2), -0.5, 0)
+
+    labels = ([FORCED_VARIANT] if FORCED_VARIANT in NAME_VARIANTS
+              else ["plain/psm6", "sharp/psm6", "plain/psm6/heb-only",
+                    "sharp/psm6/heb-only", "plain/psm11"])
 
     best: list[Word] = []
     best_score = (-1, 0.0)
-    for image, psm in ((enlarged, 6), (sharpened, 6), (enlarged, 11)):
+    prepared: dict[str, np.ndarray] = {}
+    for label in labels:
+        mode, psm, whitelist = NAME_VARIANTS[label]
+        if mode not in prepared:
+            prepared[mode] = apply_prep(enlarged, mode)
         try:
-            words = read_words(image, psm=psm, lang=NAME_LANG)
+            words = read_words(prepared[mode], psm=psm, lang=NAME_LANG,
+                               whitelist=whitelist)
         except pytesseract.TesseractError as exc:
-            log.error("name column read failed (psm %d): %s", psm, exc)
-            return []
+            log.error("name column read failed (%s): %s", label, exc)
+            continue
         keep = [w for w in words if LETTERS.search(w.text)]
         score = (len(keep), float(np.mean([w.conf for w in keep])) if keep else 0.0)
         if score > best_score:
             best, best_score = keep, score
+            log.info("  name variant %s: %d words, mean conf %.0f",
+                     label, score[0], score[1])
 
     for w in best:
         w.x = int(x0 + w.x / applied)
@@ -535,10 +610,7 @@ def load_image(data: bytes) -> np.ndarray:
     return gray
 
 
-def extract_contacts(source: np.ndarray,
-                     manual_name: tuple[int, int] | None = None,
-                     manual_phone: tuple[int, int] | None = None,
-                     ) -> tuple[list[Contact], dict]:
+def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
     started = time.monotonic()
     H, W = source.shape
     info: dict = {"width": W, "height": H}
@@ -552,26 +624,9 @@ def extract_contacts(source: np.ndarray,
         w.x, w.width = int(w.x / f), int(w.width / f)
         w.y, w.height = w.y / f, int(w.height / f)
 
-    if manual_phone:
-        # keep only what falls in the column the user marked
-        hits = [w for w in hits
-                if manual_phone[0] - 10 <= (w.x + w.right) / 2 <= manual_phone[1] + 10]
-        info["phone_band_source"] = "manual"
-
     info["located"] = len(hits)
     log.info("stage 1 located %d phone-shaped cells in %.1fs", len(hits),
              time.monotonic() - started)
-
-    if len(hits) < 2 and manual_phone:
-        # The wide pass found nothing usable, but we know where to look, so
-        # bootstrap the row geometry from the marked column alone.
-        boot = read_phone_column(source, manual_phone, 0, H, 2.0)
-        spacing = float(np.median(np.diff(sorted(y for y, _, _ in boot)))) if len(boot) > 2 else 20.0
-        hits = [Word(phone, manual_phone[0], y, max(8, int(spacing * 0.5)),
-                     manual_phone[1] - manual_phone[0], conf)
-                for y, phone, conf in boot]
-        info["located"] = len(hits)
-        info["phone_band_source"] = "manual-bootstrap"
 
     if len(hits) < 2:
         info["reason"] = "no phone column found"
@@ -589,10 +644,11 @@ def extract_contacts(source: np.ndarray,
     rows_bottom = min(H, int(max(ys) + pad))
     digit_scale = float(np.clip(TARGET_DIGIT_PX / max(6.0, row_height * 0.5), 1.0, 3.0))
     name_scale = float(np.clip(TARGET_NAME_PX / max(6.0, row_height * 0.5), 1.0, 4.0))
-    band = manual_phone or phone_band(hits, W)
+    band = phone_band(hits, W)
     letter_px = int(np.median([w.height for w in hits]))
     info.update({"row_height": round(row_height, 1), "phone_band": list(band),
-                 "letter_px": letter_px})
+                 "letter_px": letter_px, "rows_top": rows_top,
+                 "rows_bottom": rows_bottom})
     if letter_px < 15:
         # below roughly this size Hebrew stops being recoverable, while the
         # digit whitelist keeps phones working - worth saying so explicitly
@@ -637,14 +693,10 @@ def extract_contacts(source: np.ndarray,
         survey = survey_names(source, 0, survey_top, rows_bottom, digit_scale)
         survey = [w for w in survey if w.x >= band[1] - row_height]
 
-        anchor = manual_name or band_from_header(survey, row_height, W)
-        if manual_name:
-            info["band_source"] = "manual"
-        elif anchor:
+        anchor = band_from_header(survey, row_height, W)
+        if anchor:
             info["band_source"] = "header"
 
-        # A hand-drawn band is only an anchor: it snaps to whichever detected
-        # column it lands in, so the stroke doesn't have to be accurate.
         column = choose_name_column(survey, W, row_height, anchor)
         if column:
             pad = int(row_height * 0.5)
@@ -714,25 +766,68 @@ def health() -> dict:
     }
 
 
-def parse_band(raw: str | None, width: int) -> tuple[int, int] | None:
-    """A band arrives as two fractions of the image width, "0.61,0.78", so it
-    survives the client resizing the photo before upload."""
-    if not raw:
-        return None
-    try:
-        a, b = (float(v) for v in raw.split(",")[:2])
-    except ValueError:
-        return None
-    x0, x1 = sorted((a, b))
-    if not (0.0 <= x0 < x1 <= 1.0) or x1 - x0 < 0.005:
-        return None
-    return max(2, int(x0 * width)), min(width - 2, int(x1 * width))
+@app.post("/diagnose")
+async def diagnose(image: UploadFile = File(...)) -> dict:
+    """
+    Run every name-reading variant over one image and report what each produced.
+
+    This exists because the name column is the one part that can't be tuned
+    without Hebrew traineddata to test against. Rather than guessing, run the
+    sweep where Hebrew is actually installed — here — and read the numbers off.
+    Nothing leaves the server.
+    """
+    data = await image.read()
+    if not data:
+        raise HTTPException(400, "No image was uploaded.")
+
+    source = load_image(data)
+    contacts, info = extract_contacts(source)
+    band = info.get("name_band")
+    if not band:
+        return {"error": "the name column was not located", "debug": info}
+
+    row_height = info["row_height"]
+    scale = float(np.clip(TARGET_NAME_PX / max(6.0, row_height * 0.5), 1.0, 4.0))
+    crop = source[info["rows_top"]:info["rows_bottom"], band[0]:band[1]]
+    enlarged, applied = enlarge(crop, scale)
+
+    results = []
+    prepared: dict[str, np.ndarray] = {}
+    for label, (mode, psm, whitelist) in NAME_VARIANTS.items():
+        if mode not in prepared:
+            prepared[mode] = apply_prep(enlarged, mode)
+        started = time.monotonic()
+        try:
+            words = read_words(prepared[mode], psm=psm, lang=NAME_LANG,
+                               whitelist=whitelist)
+        except pytesseract.TesseractError as exc:
+            results.append({"variant": label, "error": str(exc)[:120]})
+            continue
+        keep = [w for w in words if LETTERS.search(w.text)]
+        rows = group_rows(keep, tolerance=row_height * applied * 0.45)
+        names = [got[0] for got in (clean_name(r) for r in rows) if got]
+        results.append({
+            "variant": label,
+            "words": len(keep),
+            "rows_with_a_name": len(names),
+            "mean_conf": round(float(np.mean([w.conf for w in keep])), 1) if keep else 0,
+            "seconds": round(time.monotonic() - started, 1),
+            "sample": names[:6],
+        })
+
+    results.sort(key=lambda r: (-r.get("rows_with_a_name", 0), -r.get("mean_conf", 0)))
+    return {
+        "phones_found": len(contacts),
+        "letter_px": info.get("letter_px"),
+        "name_band": band,
+        "scale_applied": round(applied, 2),
+        "hint": "the variant at the top read the most rows; set NAME_VARIANT to it",
+        "variants": results,
+    }
 
 
 @app.post("/extract")
-async def extract(image: UploadFile = File(...),
-                  name_band: str | None = Form(None),
-                  phone_band: str | None = Form(None)) -> dict:
+async def extract(image: UploadFile = File(...)) -> dict:
     data = await image.read()
     if not data:
         raise HTTPException(400, "No image was uploaded.")
@@ -741,11 +836,7 @@ async def extract(image: UploadFile = File(...),
 
     started = time.monotonic()
     source = load_image(data)
-    contacts, info = extract_contacts(
-        source,
-        manual_name=parse_band(name_band, source.shape[1]),
-        manual_phone=parse_band(phone_band, source.shape[1]),
-    )
+    contacts, info = extract_contacts(source)
     seconds = round(time.monotonic() - started, 1)
     log.info("extracted %d contacts in %.1fs %s", len(contacts), seconds, info)
 
