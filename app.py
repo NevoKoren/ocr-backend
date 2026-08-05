@@ -44,11 +44,15 @@ cell instead reliably picks a role like "לוחם ימי גברים" over the ac
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import io
+import json
 import logging
 import os
+import queue
 import re
+import threading
 import time
 from dataclasses import dataclass
 
@@ -57,7 +61,7 @@ import numpy as np
 import pytesseract
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image, ImageOps
 
 logging.basicConfig(level=logging.INFO)
@@ -71,6 +75,9 @@ ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",
 
 MAX_UPLOAD_BYTES = 12 * 1024 * 1024
 MAX_SOURCE_WIDTH = 4000       # cap the original, for memory
+# Left at 1800 deliberately. Narrowing it to 1600 or 1400 is faster, but on one
+# real sheet it cost a row of phone numbers, and the whole run only got about a
+# second shorter — the time goes on the full-page read, not here.
 LOCATE_WIDTH = 1800           # the cheap first pass runs here
 TARGET_DIGIT_PX = 30          # Tesseract's comfort zone for digit height
 TARGET_NAME_PX = 48           # measured: 44-56 clearly beats 36 on faint text
@@ -760,6 +767,10 @@ def read_name_column(source: np.ndarray, band: tuple[int, int],
             best, best_score = keep, score
             log.info("  name variant %s: %d words, mean conf %.0f",
                      label, score[0], score[1])
+        # The first variant wins on real sheets often enough that trying the
+        # rest is usually wasted time. Only keep looking if this one is weak.
+        if best_score[0] >= 8 and best_score[1] >= 60:
+            break
 
     for w in best:
         w.x = int(x0 + w.x / applied)
@@ -802,7 +813,17 @@ def load_image(data: bytes) -> np.ndarray:
     return gray
 
 
-def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
+def extract_contacts(source: np.ndarray,
+                     report=None) -> tuple[list[Contact], dict]:
+    """report(percent, stage) is called as each stage completes, so the client
+    can show real progress instead of a timer-driven guess."""
+    def step(percent: int, stage: str) -> None:
+        if report:
+            try:
+                report(percent, stage)
+            except Exception:            # never let reporting break extraction
+                log.debug("progress report failed", exc_info=True)
+
     started = time.monotonic()
     H, W = source.shape
     info: dict = {"width": W, "height": H}
@@ -811,7 +832,9 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
     f = min(1.0, LOCATE_WIDTH / W)
     locate_img = (source if f == 1.0 else
                   cv2.resize(source, None, fx=f, fy=f, interpolation=cv2.INTER_AREA))
+    step(8, "מאתר את הטבלה בתמונה")
     hits = locate_phones(locate_img)
+    step(26, "קורא מספרי טלפון")
     for w in hits:                                   # back to source coordinates
         w.x, w.width = int(w.x / f), int(w.width / f)
         w.y, w.height = w.y / f, int(w.height / f)
@@ -854,6 +877,7 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
     # two disagree it has the resolution advantage.
     t = time.monotonic()
     strip = read_phone_column(source, band, rows_top, rows_bottom, digit_scale)
+    step(38, "קורא את הדף במלואו")
     log.info("stage 2 read %d phones from the column strip in %.1fs",
              len(strip), time.monotonic() - t)
 
@@ -884,6 +908,7 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
     if time.monotonic() - started < TIME_BUDGET_SECONDS:
         t = time.monotonic()
         page, how, page_conf = read_page(source, TIME_BUDGET_SECONDS - (t - started))
+        step(72, "מאתר את עמודת השמות")
         page_words = page          # unfiltered, so the date banner above the table survives
 
         # Claim the time column first. If the name column is chosen first it can
@@ -938,6 +963,7 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
     # base, and the other only fills rows the base missed.
     if name_band and time.monotonic() - started < TIME_BUDGET_SECONDS:
         t = time.monotonic()
+        step(80, "קורא שמות בעברית")
         column_words = read_name_column(source, name_band, rows_top, rows_bottom,
                                         name_scale)
         strip_names = names_by_row(column_words, row_height)
@@ -978,6 +1004,7 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
     # --- date and time -----------------------------------------------------
     # The time column sits to the right of the name column on a right-to-left
     # sheet; anything left of that is a different column entirely.
+    step(90, "מחלץ תאריכים ושעות")
     times: list[tuple[float, str, float]] = []
     dates: list[tuple[float, str, float]] = []
     global_time = ""
@@ -1004,6 +1031,7 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
                  info.get("date", "not found"), len(times), len(dates), global_time)
 
     # --- pair by vertical position ----------------------------------------
+    step(96, "מחבר שמות למספרים ולמועדים")
     name_rows = sorted(names.values())
     contacts: dict[str, Contact] = {}
     for y, phone, phone_conf in phones:
@@ -1062,6 +1090,61 @@ def pretty_phone(digits: str) -> str:
     return f"{digits[:3]}-{digits[3:]}" if len(digits) == 10 else digits
 
 
+@app.post("/scan")
+async def scan(file: UploadFile = File(...)):
+    """
+    Same work as /upload/, but streamed as NDJSON so the page can show real
+    progress instead of a timer-driven guess.
+
+    Each line is one JSON object: {"type":"progress"} as stages complete, then
+    a single {"type":"done"} carrying the same payload /upload/ returns. The
+    extraction is CPU-bound and synchronous, so it runs on a worker thread and
+    pushes updates through a queue that the response generator drains.
+    """
+    data = await file.read()
+    if not data:
+        return JSONResponse(status_code=400,
+                            content={"status": "error", "message": "לא התקבלה תמונה."})
+    if len(data) > MAX_UPLOAD_BYTES:
+        return JSONResponse(status_code=413,
+                            content={"status": "error", "message": "התמונה גדולה מ-12MB."})
+
+    updates: queue.Queue = queue.Queue()
+
+    def work() -> None:
+        try:
+            source = load_image(data)
+            contacts, info = extract_contacts(
+                source,
+                report=lambda pct, stage: updates.put(
+                    {"type": "progress", "percent": pct, "stage": stage}),
+            )
+            updates.put({"type": "done", **build_payload(contacts, info)})
+        except HTTPException as exc:
+            updates.put({"type": "error", "message": str(exc.detail)})
+        except Exception as exc:                       # noqa: BLE001
+            log.exception("scan failed")
+            updates.put({"type": "error", "message": str(exc)[:200]})
+        finally:
+            updates.put(None)
+
+    threading.Thread(target=work, daemon=True).start()
+
+    async def stream():
+        # an immediate first line so the browser opens the stream right away
+        yield json.dumps({"type": "progress", "percent": 3,
+                          "stage": "מקבל את התמונה"}, ensure_ascii=False) + "\n"
+        while True:
+            item = await asyncio.to_thread(updates.get)
+            if item is None:
+                break
+            yield json.dumps(item, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson",
+                             headers={"Cache-Control": "no-store",
+                                      "X-Accel-Buffering": "no"})
+
+
 @app.post("/upload/")
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)) -> dict:
@@ -1093,6 +1176,14 @@ async def upload(file: UploadFile = File(...)) -> dict:
         return JSONResponse(status_code=500,
                             content={"status": "error", "message": str(exc)[:200]})
 
+    payload = build_payload(contacts, info)
+    rows = payload["data"]
+    log.info("upload: returned %d rows to the scheduling site", len(rows))
+    return payload
+
+
+def build_payload(contacts: list[Contact], info: dict) -> dict:
+    """The response body shared by /upload/ and /scan."""
     sheet_date = info.get("date", "")
     rows, lines = [], []
     for index, c in enumerate(contacts):
@@ -1118,7 +1209,6 @@ async def upload(file: UploadFile = File(...)) -> dict:
             "time_matched": c.time,
         })
 
-    log.info("upload: returned %d rows to the scheduling site", len(rows))
     return {
         "status": "success",
         "data": rows,
@@ -1129,6 +1219,9 @@ async def upload(file: UploadFile = File(...)) -> dict:
             "extractor": info,
         },
     }
+
+    log.info("upload: returned %d rows to the scheduling site", len(rows))
+    return payload
 
 
 @app.post("/diagnose")
