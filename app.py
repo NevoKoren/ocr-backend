@@ -273,29 +273,6 @@ def read_phone_column(source: np.ndarray, band: tuple[int, int],
 # Stage 3 — find the name column
 # --------------------------------------------------------------------------
 
-def survey_names(source: np.ndarray, left: int, top: int, bottom: int,
-                 scale: float) -> list[Word]:
-    """Wide-ish pass over the right-hand side, including the heading row, to
-    work out where the name column is. Sparse mode, because this region still
-    holds several columns."""
-    crop = source[top:bottom, left:]
-    if crop.size == 0:
-        return []
-    enlarged, applied = enlarge(crop, scale)
-    try:
-        words = read_words(enlarged, psm=11, lang=NAME_LANG)
-    except pytesseract.TesseractError as exc:
-        log.error("name survey failed: %s", exc)
-        return []
-
-    for w in words:
-        w.x = int(left + w.x / applied)
-        w.width = int(w.width / applied)
-        w.y = top + w.y / applied
-        w.height = int(w.height / applied)
-    return [w for w in words if LETTERS.search(w.text)]
-
-
 def band_from_header(words: list[Word], row_height: int,
                      page_width: int) -> tuple[int, int] | None:
     """Find the "שם מלא" heading and return its column's horizontal extent.
@@ -436,37 +413,12 @@ def choose_name_column(words: list[Word], page_width: int, row_height: float,
     return best
 
 
-def band_from_rows(words: list[Word], row_height: float,
-                   page_width: int) -> tuple[int, int] | None:
-    """Fallback when the heading can't be read: the rightmost cell of each data
-    row. Medians, not extremes, so one row that reads badly can't stretch the
-    band across neighbouring columns."""
-    lefts, rights = [], []
-    for row in group_rows(words, tolerance=row_height * 0.45):
-        cells = split_cells(row)
-        if not cells:
-            continue
-        rightmost = cells[0]
-        if clean_name(rightmost):
-            lefts.append(min(w.x for w in rightmost))
-            rights.append(max(w.right for w in rightmost))
-
-    if len(lefts) < 3:
-        return None
-    left, right = float(np.median(lefts)), float(np.median(rights))
-    pad = (right - left) * 0.3
-    return (max(2, int(left - pad)), min(page_width - 2, int(right + pad)))
-
-
-# --------------------------------------------------------------------------
-# Stage 4 — read the name column on its own
-# --------------------------------------------------------------------------
-
 # The name column contains Hebrew letters and nothing else. Constraining the
 # charset is the same trick that makes the phone column near-perfect: it strips
 # out every Latin and digit confusion before they can happen.
 # No quote characters here — pytesseract splits the config with shlex, so a
-# stray quote makes the whole call fail.
+# stray quote makes the whole call fail, and the whole thing gets quoted in
+# read_words so the space survives the split.
 HEBREW_ALPHABET = "אבגדהוזחטיכלמנסעפצקרשתךםןףץ -"
 
 
@@ -524,6 +476,39 @@ def apply_prep(image: np.ndarray, mode: str) -> np.ndarray:
     if mode == "nolines":
         return sharpen(remove_rules(image))
     return image
+
+
+def read_page(source: np.ndarray, budget_left: float) -> tuple[list[Word], str]:
+    """
+    Read the whole image exactly as it arrived — no crop, no enlargement, no
+    filtering.
+
+    This is the approach that worked before any of the column machinery
+    existed, and it has a real advantage: every transformation I apply is a
+    chance to destroy strokes that were legible to begin with. Enlarging an
+    11px letter 2.8x with cubic interpolation turns JPEG ringing into strokes
+    that were never there. Reading the original pixels avoids all of it, and
+    the layout work then happens on the coordinates rather than on the image.
+    """
+    best: list[Word] = []
+    label = "none"
+    for psm in (6, 11):
+        if best and budget_left <= 0:
+            break
+        try:
+            words = read_words(source, psm=psm, lang=f"{NAME_LANG}+eng")
+        except pytesseract.TesseractError as exc:
+            log.error("raw page read failed (psm %d): %s", psm, exc)
+            continue
+        keep = [w for w in words if LETTERS.search(w.text)]
+        conf = float(np.mean([w.conf for w in keep])) if keep else 0.0
+        log.info("  raw page psm%d: %d letter-words, mean conf %.0f",
+                 psm, len(keep), conf)
+        if len(keep) > len(best):
+            best, label = keep, f"raw/psm{psm}"
+        if len(best) >= 20 and conf >= 60:
+            break
+    return best, label
 
 
 def read_name_column(source: np.ndarray, band: tuple[int, int],
@@ -682,49 +667,59 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
         info["reason"] = "phone column unreadable"
         return [], info
 
-    # --- stage 3: locate the name column ----------------------------------
+    # --- stage 3: read the page and locate the name column -----------------
     names: dict[int, tuple[float, str, float]] = {}
     name_band = None
 
     if time.monotonic() - started < TIME_BUDGET_SECONDS:
         t = time.monotonic()
-        # start above the data rows so the heading row is inside the crop
-        survey_top = max(0, int(rows_top - row_height * 2))
-        survey = survey_names(source, 0, survey_top, rows_bottom, digit_scale)
-        survey = [w for w in survey if w.x >= band[1] - row_height]
+        page, how = read_page(source, TIME_BUDGET_SECONDS - (t - started))
+        # only what lies right of the phone column can be the name
+        page = [w for w in page if w.x >= band[1] - row_height]
 
-        anchor = band_from_header(survey, row_height, W)
+        anchor = band_from_header(page, row_height, W)
         if anchor:
             info["band_source"] = "header"
-
-        column = choose_name_column(survey, W, row_height, anchor)
+        column = choose_name_column(page, W, row_height, anchor)
         if column:
             pad = int(row_height * 0.5)
             name_band = (max(2, column[0] - pad), min(W - 2, column[1] + pad))
             info.setdefault("band_source", "columns")
         elif anchor:
-            name_band = widen_to_content(anchor, survey, row_height, W)
+            name_band = widen_to_content(anchor, page, row_height, W)
         else:
             info["band_source"] = "none"
 
-        log.info("stage 3 surveyed %d words, %d columns, name band %s (%s) in %.1fs",
-                 len(survey), len(detect_columns(survey, W, row_height)), name_band,
+        info["page_read"] = how
+        log.info("stage 3 read the page (%s): %d words, %d columns, band %s (%s) in %.1fs",
+                 how, len(page), len(detect_columns(page, W, row_height)), name_band,
                  info.get("band_source"), time.monotonic() - t)
 
-        if name_band:
-            names = cells_in_column(survey, name_band, row_height)
-        else:
-            names = names_by_row(survey, row_height)
+        names = (cells_in_column(page, name_band, row_height) if name_band
+                 else names_by_row(page, row_height))
+        info["names_from_page"] = len(names)
 
-    # --- stage 4: read the name column on its own -------------------------
-    if name_band and time.monotonic() - started < TIME_BUDGET_SECONDS:
+    # --- stage 4: enlarged read, only when it's likely to help -------------
+    # Measured: at ~10px letters the enlarged crop beats the raw page 22 to 19;
+    # at 15px and above the raw page wins and enlarging costs accuracy. So this
+    # runs when the raw read came up short, or when the letters are small
+    # enough that enlarging has something to offer. The two are merged per row
+    # by confidence rather than one replacing the other.
+    if (name_band and (len(names) < 3 or letter_px < 14)
+            and time.monotonic() - started < TIME_BUDGET_SECONDS):
         t = time.monotonic()
-        column = read_name_column(source, name_band, rows_top, rows_bottom, name_scale)
-        log.info("stage 4 read %d words from the name column in %.1fs",
-                 len(column), time.monotonic() - t)
-        for key, value in names_by_row(column, row_height, bonus=8).items():
-            if key not in names or value[2] > names[key][2]:
+        column_words = read_name_column(source, name_band, rows_top, rows_bottom,
+                                        name_scale)
+        merged = 0
+        for key, value in names_by_row(column_words, row_height).items():
+            # The enlarged read reports slightly higher confidence even when it
+            # is wrong, so it has to win by a real margin before it replaces a
+            # row the untouched read already produced.
+            if key not in names or value[2] > names[key][2] + 12:
                 names[key] = value
+                merged += 1
+        log.info("stage 4 enlarged read: %d words, %d rows improved, in %.1fs",
+                 len(column_words), merged, time.monotonic() - t)
 
     info["names_found"] = len(names)
     info["name_band"] = list(name_band) if name_band else None
@@ -792,6 +787,20 @@ async def diagnose(image: UploadFile = File(...)) -> dict:
     enlarged, applied = enlarge(crop, scale)
 
     results = []
+    started = time.monotonic()
+    page, how = read_page(source, 60.0)
+    page = [w for w in page if w.x >= info["phone_band"][1] - row_height]
+    page_names = [g[0] for g in
+                  (clean_name(r) for r in group_rows(page, row_height * 0.45)) if g]
+    results.append({
+        "variant": f"whole page, untouched ({how})",
+        "words": len(page),
+        "rows_with_a_name": len(cells_in_column(page, band, row_height)),
+        "mean_conf": round(float(np.mean([w.conf for w in page])), 1) if page else 0,
+        "seconds": round(time.monotonic() - started, 1),
+        "sample": page_names[:6],
+    })
+
     prepared: dict[str, np.ndarray] = {}
     for label, (mode, psm, whitelist) in NAME_VARIANTS.items():
         if mode not in prepared:
