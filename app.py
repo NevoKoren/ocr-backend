@@ -478,21 +478,25 @@ def apply_prep(image: np.ndarray, mode: str) -> np.ndarray:
     return image
 
 
-def read_page(source: np.ndarray, budget_left: float) -> tuple[list[Word], str]:
+def read_page(source: np.ndarray, budget_left: float) -> tuple[list[Word], str, float]:
     """
     Read the whole image exactly as it arrived — no crop, no enlargement, no
     filtering.
 
-    This is the approach that worked before any of the column machinery
-    existed, and it has a real advantage: every transformation I apply is a
-    chance to destroy strokes that were legible to begin with. Enlarging an
-    11px letter 2.8x with cubic interpolation turns JPEG ringing into strokes
-    that were never there. Reading the original pixels avoids all of it, and
-    the layout work then happens on the coordinates rather than on the image.
+    Every transformation is a chance to destroy strokes that were legible to
+    begin with: enlarging an 11px letter 2.8x with cubic interpolation turns
+    JPEG ringing into strokes that were never there. Reading the original
+    pixels avoids all of it, and the layout work then happens on the returned
+    coordinates rather than on the image.
+
+    Sparse mode goes first because on a real sheet it beat uniform-block mode
+    by a mile — 125 words at confidence 79 against 48 words at confidence 24.
+    A spreadsheet is not a block of prose, and telling Tesseract it is makes it
+    force text into a layout that isn't there.
     """
     best: list[Word] = []
-    label = "none"
-    for psm in (6, 11):
+    label, best_conf = "none", 0.0
+    for psm in (11, 6):
         if best and budget_left <= 0:
             break
         try:
@@ -504,11 +508,13 @@ def read_page(source: np.ndarray, budget_left: float) -> tuple[list[Word], str]:
         conf = float(np.mean([w.conf for w in keep])) if keep else 0.0
         log.info("  raw page psm%d: %d letter-words, mean conf %.0f",
                  psm, len(keep), conf)
-        if len(keep) > len(best):
-            best, label = keep, f"raw/psm{psm}"
-        if len(best) >= 20 and conf >= 60:
-            break
-    return best, label
+        # Word count alone is a bad score: a pass can return more words that are
+        # mostly noise. Weight the count by how sure Tesseract is of them.
+        if len(keep) * max(conf, 1.0) > len(best) * max(best_conf, 1.0):
+            best, label, best_conf = keep, f"raw/psm{psm}", conf
+        if len(best) >= 20 and best_conf >= 60:
+            break            # already good — don't pay for the second pass
+    return best, label, best_conf
 
 
 def read_name_column(source: np.ndarray, band: tuple[int, int],
@@ -673,7 +679,7 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
 
     if time.monotonic() - started < TIME_BUDGET_SECONDS:
         t = time.monotonic()
-        page, how = read_page(source, TIME_BUDGET_SECONDS - (t - started))
+        page, how, page_conf = read_page(source, TIME_BUDGET_SECONDS - (t - started))
         # only what lies right of the phone column can be the name
         page = [w for w in page if w.x >= band[1] - row_height]
 
@@ -691,6 +697,7 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
             info["band_source"] = "none"
 
         info["page_read"] = how
+        info["page_conf"] = round(page_conf)
         log.info("stage 3 read the page (%s): %d words, %d columns, band %s (%s) in %.1fs",
                  how, len(page), len(detect_columns(page, W, row_height)), name_band,
                  info.get("band_source"), time.monotonic() - t)
@@ -705,13 +712,19 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
     # runs when the raw read came up short, or when the letters are small
     # enough that enlarging has something to offer. The two are merged per row
     # by confidence rather than one replacing the other.
-    if (name_band and (len(names) < 3 or letter_px < 14)
+    # Confidence alone is not enough to skip the enlarged pass: on small text
+    # the raw read can be confidently wrong. Both signals have to agree.
+    page_was_good = (info.get("page_conf", 0) >= 65 and letter_px >= 14
+                     and len(names) >= 3)
+    if (name_band and not page_was_good and (len(names) < 3 or letter_px < 14)
             and time.monotonic() - started < TIME_BUDGET_SECONDS):
         t = time.monotonic()
         column_words = read_name_column(source, name_band, rows_top, rows_bottom,
                                         name_scale)
         merged = 0
         for key, value in names_by_row(column_words, row_height).items():
+            if value[2] < 45:
+                continue        # too unsure to be worth adding at all
             # The enlarged read reports slightly higher confidence even when it
             # is wrong, so it has to win by a real margin before it replaces a
             # row the untouched read already produced.
@@ -788,7 +801,7 @@ async def diagnose(image: UploadFile = File(...)) -> dict:
 
     results = []
     started = time.monotonic()
-    page, how = read_page(source, 60.0)
+    page, how, _ = read_page(source, 60.0)
     page = [w for w in page if w.x >= info["phone_band"][1] - row_height]
     page_names = [g[0] for g in
                   (clean_name(r) for r in group_rows(page, row_height * 0.45)) if g]
