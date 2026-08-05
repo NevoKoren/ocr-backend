@@ -44,6 +44,7 @@ cell instead reliably picks a role like "לוחם ימי גברים" over the ac
 
 from __future__ import annotations
 
+import datetime
 import io
 import logging
 import os
@@ -123,6 +124,7 @@ class Contact:
     name: str
     phone: str
     confidence: int
+    time: str = ""      # appointment time for this row, e.g. "08:30"
 
 
 # --------------------------------------------------------------------------
@@ -495,6 +497,7 @@ def read_page(source: np.ndarray, budget_left: float) -> tuple[list[Word], str, 
     force text into a layout that isn't there.
     """
     best: list[Word] = []
+    best_letters: list[Word] = []
     label, best_conf = "none", 0.0
     for psm in (11, 6):
         if best and budget_left <= 0:
@@ -504,17 +507,168 @@ def read_page(source: np.ndarray, budget_left: float) -> tuple[list[Word], str, 
         except pytesseract.TesseractError as exc:
             log.error("raw page read failed (psm %d): %s", psm, exc)
             continue
+        # Scored on the letter words, but ALL words are returned: the date
+        # banner and the time column are digits, and they'd be lost otherwise.
         keep = [w for w in words if LETTERS.search(w.text)]
         conf = float(np.mean([w.conf for w in keep])) if keep else 0.0
-        log.info("  raw page psm%d: %d letter-words, mean conf %.0f",
-                 psm, len(keep), conf)
+        log.info("  raw page psm%d: %d letter-words of %d, mean conf %.0f",
+                 psm, len(keep), len(words), conf)
         # Word count alone is a bad score: a pass can return more words that are
         # mostly noise. Weight the count by how sure Tesseract is of them.
-        if len(keep) * max(conf, 1.0) > len(best) * max(best_conf, 1.0):
-            best, label, best_conf = keep, f"raw/psm{psm}", conf
-        if len(best) >= 20 and best_conf >= 60:
+        if len(keep) * max(conf, 1.0) > len(best_letters) * max(best_conf, 1.0):
+            best, best_letters, label, best_conf = words, keep, f"raw/psm{psm}", conf
+        if len(best_letters) >= 20 and best_conf >= 60:
             break            # already good — don't pay for the second pass
     return best, label, best_conf
+
+
+# --------------------------------------------------------------------------
+# Appointment date and time
+# --------------------------------------------------------------------------
+
+# A colon often reads as a dot or a semicolon at this text size.
+TIME_TOKEN = re.compile(r"^([0-2]?\d)\s*[:;.\u05C3]\s*([0-5]\d)$")
+NUMERIC_DATE = re.compile(r"^(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2,4})$")
+
+HEBREW_MONTHS = {
+    "ינואר": 1, "פברואר": 2, "מרץ": 3, "מרס": 3, "אפריל": 4, "מאי": 5,
+    "יוני": 6, "יולי": 7, "אוגוסט": 8, "ספטמבר": 9, "אוקטובר": 10,
+    "נובמבר": 11, "דצמבר": 12,
+}
+# Months appear inflected — "ביולי" is "in July" — so allow a prefix letter.
+MONTH_TOKEN = re.compile(r"^[בהלמו]?(" + "|".join(HEBREW_MONTHS) + r")$")
+
+WEEKDAYS = ["ראשון", "שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת"]
+
+
+def parse_time(text: str) -> str | None:
+    match = TIME_TOKEN.match((text or "").strip())
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    return f"{hour:02d}:{minute:02d}" if hour <= 23 else None
+
+
+def find_sheet_date(words: list[Word], row_height: float) -> dict | None:
+    """
+    Find the date banner that sits above the table.
+
+    Two shapes appear: a written Hebrew date like "יום רביעי 15 ביולי 2026",
+    and a numeric one like 15/07/2026. For the written form the day and year
+    are separate words on the same line as the month, so the month is located
+    first and its row is then searched for the rest.
+    """
+    for word in words:
+        numeric = NUMERIC_DATE.match(word.text.strip())
+        if numeric:
+            day, month, year = (int(v) for v in numeric.groups())
+            if year < 100:
+                year += 2000
+            if 1 <= day <= 31 and 1 <= month <= 12:
+                return {"date": f"{year:04d}-{month:02d}-{day:02d}",
+                        "date_text": word.text.strip()}
+
+    for word in words:
+        match = MONTH_TOKEN.match(word.text.strip())
+        if not match:
+            continue
+        month = HEBREW_MONTHS[match.group(1)]
+        line = [w for w in words if abs(w.y - word.y) <= row_height * 0.6]
+        day = year = None
+        weekday = ""
+        for other in sorted(line, key=lambda w: -w.x):
+            text = other.text.strip()
+            if text in WEEKDAYS:
+                weekday = text
+            if not text.isdigit():
+                continue
+            value = int(text)
+            if len(text) == 4 and 1900 <= value <= 2100:
+                year = value
+            elif day is None and 1 <= value <= 31:
+                day = value
+        if day is None:
+            continue
+        if year is None:
+            year = datetime.date.today().year
+        text = " ".join(w.text.strip() for w in sorted(line, key=lambda w: -w.x))
+        return {"date": f"{year:04d}-{month:02d}-{day:02d}",
+                "date_text": text[:60],
+                "weekday": weekday}
+    return None
+
+
+def collect_times(source: np.ndarray, page: list[Word], rows_top: int,
+                  rows_bottom: int, row_height: float,
+                  left_limit: int) -> list[tuple[float, str, float]]:
+    """
+    Gather the appointment times, then re-read their column properly.
+
+    The times sit in the rightmost column of a right-to-left sheet, to the
+    right of the name. Restricting to that side keeps a clock in the taskbar or
+    a timestamp in the Excel ribbon out of the results.
+    """
+    seen = [(w, parse_time(w.text)) for w in page]
+    candidates = [w for w, t in seen
+                  if t and w.x >= left_limit and rows_top <= w.y <= rows_bottom]
+    if not candidates:
+        return []
+
+    # keep only the dominant column, in case a stray time appears elsewhere
+    centre = float(np.median([w.x + w.width / 2 for w in candidates]))
+    spread = max(float(np.median([w.width for w in candidates])) * 1.5,
+                 row_height * 1.5)
+    column = [w for w in candidates if abs(w.x + w.width / 2 - centre) <= spread]
+    if not column:
+        return []
+
+    x0 = max(2, int(min(w.x for w in column) - row_height * 0.4))
+    x1 = min(source.shape[1] - 2, int(max(w.right for w in column) + row_height * 0.4))
+
+    found = [(w.y, parse_time(w.text) or "", w.conf) for w in column]
+
+    # A second, whitelisted read of just this strip, the same treatment the
+    # phone column gets — digits are far more reliable with the charset pinned.
+    scale = float(np.clip(TARGET_DIGIT_PX / max(6.0, row_height * 0.5), 1.0, 3.0))
+    crop = source[rows_top:rows_bottom, x0:x1]
+    if crop.size:
+        enlarged, applied = enlarge(remove_rules(crop), scale)
+        try:
+            for w in read_words(enlarged, psm=11, lang="eng", whitelist="0123456789:."):
+                value = parse_time(w.text)
+                if value:
+                    found.append((rows_top + w.y / applied, value, w.conf + 8))
+        except pytesseract.TesseractError as exc:
+            log.error("time column read failed: %s", exc)
+
+    by_row: dict[int, tuple[float, str, float]] = {}
+    for y, value, conf in found:
+        key = round(y / (row_height * 0.5))
+        if key not in by_row or conf > by_row[key][2]:
+            by_row[key] = (y, value, conf)
+    return sorted(by_row.values())
+
+
+def time_for_row(y: float, times: list[tuple[float, str, float]],
+                 row_height: float) -> str:
+    """
+    Match a row to its time.
+
+    A merged cell prints its value once for the whole block it spans, so an
+    exact vertical match often doesn't exist. When only one or two times were
+    found the sheet is using a single merged cell for everything and the
+    nearest one applies to every row. Otherwise the value carries down from the
+    nearest time at or above the row, which is how a merged block behaves.
+    """
+    if not times:
+        return ""
+    nearest = min(times, key=lambda t: abs(t[0] - y))
+    if abs(nearest[0] - y) <= row_height * 0.7:
+        return nearest[1]
+    if len(times) <= 2:
+        return nearest[1]                      # one merged cell for the sheet
+    above = [t for t in times if t[0] <= y + row_height * 0.5]
+    return (above[-1] if above else nearest)[1]
 
 
 def read_name_column(source: np.ndarray, band: tuple[int, int],
@@ -681,12 +835,14 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
     # --- stage 3: read the page and locate the name column -----------------
     names: dict[int, tuple[float, str, float]] = {}
     name_band = None
+    page_words: list[Word] = []
 
     if time.monotonic() - started < TIME_BUDGET_SECONDS:
         t = time.monotonic()
         page, how, page_conf = read_page(source, TIME_BUDGET_SECONDS - (t - started))
-        # only what lies right of the phone column can be the name
-        page = [w for w in page if w.x >= band[1] - row_height]
+        page_words = page          # unfiltered, so the date banner above the table survives
+        # only Hebrew words to the right of the phone column can be the name
+        page = [w for w in page if LETTERS.search(w.text) and w.x >= band[1] - row_height]
 
         anchor = band_from_header(page, row_height, W)
         if anchor:
@@ -759,6 +915,21 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
     info["names_found"] = len(names)
     info["name_band"] = list(name_band) if name_band else None
 
+    # --- date and time -----------------------------------------------------
+    # The time column sits to the right of the name column on a right-to-left
+    # sheet; anything left of that is a different column entirely.
+    times: list[tuple[float, str, float]] = []
+    if page_words:
+        found_date = find_sheet_date(page_words, row_height)
+        if found_date:
+            info.update(found_date)
+        left_limit = (name_band[1] - int(row_height)) if name_band else band[1]
+        times = collect_times(source, page_words, rows_top, rows_bottom,
+                              row_height, left_limit)
+        info["times_found"] = len(times)
+        log.info("date %s, %d appointment times found",
+                 info.get("date", "not found"), len(times))
+
     # --- pair by vertical position ----------------------------------------
     name_rows = sorted(names.values())
     contacts: dict[str, Contact] = {}
@@ -773,7 +944,9 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
         confidence = int(round((phone_conf + name_conf) / 2)) if name else 45
         existing = contacts.get(phone)
         if existing is None or confidence > existing.confidence:
-            contacts[phone] = Contact(name=name, phone=phone, confidence=confidence)
+            contacts[phone] = Contact(name=name, phone=phone,
+                                      confidence=confidence,
+                                      time=time_for_row(y, times, row_height))
 
     info["seconds"] = round(time.monotonic() - started, 1)
     return list(contacts.values()), info
@@ -885,8 +1058,11 @@ async def extract(image: UploadFile = File(...)) -> dict:
     log.info("extracted %d contacts in %.1fs %s", len(contacts), seconds, info)
 
     return {
+        "date": info.get("date", ""),
+        "date_text": info.get("date_text", ""),
         "contacts": [
-            {"name": c.name, "phone": c.phone, "confidence": c.confidence}
+            {"name": c.name, "phone": c.phone, "time": c.time,
+             "confidence": c.confidence}
             for c in contacts
         ],
         "count": len(contacts),
