@@ -527,8 +527,12 @@ def read_page(source: np.ndarray, budget_left: float) -> tuple[list[Word], str, 
 # Appointment date and time
 # --------------------------------------------------------------------------
 
-# A colon often reads as a dot or a semicolon at this text size.
-TIME_TOKEN = re.compile(r"^([0-2]?\d)\s*[:;.\u05C3]\s*([0-5]\d)$")
+# Times appear in several shapes across sheets: 8:30, 08:30, and 08:00:00 with
+# a seconds component that Excel adds when the cell is formatted as a time. The
+# seconds are matched so the token is recognised, then discarded. A colon often
+# reads as a dot or a semicolon at this text size, so those count as separators.
+TIME_TOKEN = re.compile(
+    r"^([0-2]?\d)\s*[:;.\u05C3]\s*([0-5]\d)(?:\s*[:;.\u05C3]\s*([0-5]\d))?$")
 NUMERIC_DATE = re.compile(r"^(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2,4})$")
 
 HEBREW_MONTHS = {
