@@ -75,7 +75,7 @@ TARGET_DIGIT_PX = 30          # Tesseract's comfort zone for digit height
 TARGET_NAME_PX = 48           # measured: 44-56 clearly beats 36 on faint text
 MAX_CROP_PIXELS = 3_000_000   # ceiling on any single enlarged crop
 
-TIME_BUDGET_SECONDS = float(os.getenv("TIME_BUDGET_SECONDS", "55"))
+TIME_BUDGET_SECONDS = float(os.getenv("TIME_BUDGET_SECONDS", "95"))
 
 NAME_LANG = os.getenv("NAME_LANG", "heb")
 DIGITS_ONLY = "0123456789-"
@@ -125,6 +125,7 @@ class Contact:
     phone: str
     confidence: int
     time: str = ""      # appointment time for this row, e.g. "08:30"
+    date: str = ""      # per-row date if the sheet has one, else the sheet date
 
 
 # --------------------------------------------------------------------------
@@ -598,43 +599,77 @@ def find_sheet_date(words: list[Word], row_height: float) -> dict | None:
     return None
 
 
-def collect_times(source: np.ndarray, page: list[Word], rows_top: int,
-                  rows_bottom: int, row_height: float,
-                  left_limit: int) -> list[tuple[float, str, float]]:
+def find_time_column(page: list[Word], rows_top: int, rows_bottom: int,
+                     row_height: float, left_limit: int, page_width: int
+                     ) -> tuple[tuple[int, int] | None, list[Word]]:
     """
-    Gather the appointment times, then re-read their column properly.
+    Find the appointment-time column on its own, before anything else claims it.
 
-    The times sit in the rightmost column of a right-to-left sheet, to the
-    right of the name. Restricting to that side keeps a clock in the taskbar or
-    a timestamp in the Excel ribbon out of the results.
+    This has to run before the name column is chosen. On one sheet the gap
+    between the name and the time column is narrower than a column corridor, so
+    the two merge and the name band swallows the times — after which no time
+    can ever be found, because it's being searched for outside its own band.
     """
-    seen = [(w, parse_time(w.text)) for w in page]
-    candidates = [w for w, t in seen
-                  if t and w.x >= left_limit and rows_top <= w.y <= rows_bottom]
-    if not candidates:
-        return []
+    hits = [w for w in page
+            if parse_time(w.text) and w.x >= left_limit
+            and rows_top - row_height <= w.y <= rows_bottom + row_height]
+    if not hits:
+        return None, []
 
-    # keep only the dominant column, in case a stray time appears elsewhere
-    centre = float(np.median([w.x + w.width / 2 for w in candidates]))
-    spread = max(float(np.median([w.width for w in candidates])) * 1.5,
-                 row_height * 1.5)
-    column = [w for w in candidates if abs(w.x + w.width / 2 - centre) <= spread]
+    # keep only the dominant column, so a stray time elsewhere can't drag it
+    centre = float(np.median([w.x + w.width / 2 for w in hits]))
+    spread = max(float(np.median([w.width for w in hits])) * 1.5, row_height * 1.5)
+    column = [w for w in hits if abs(w.x + w.width / 2 - centre) <= spread]
     if not column:
-        return []
+        return None, []
 
     x0 = max(2, int(min(w.x for w in column) - row_height * 0.4))
-    x1 = min(source.shape[1] - 2, int(max(w.right for w in column) + row_height * 0.4))
+    x1 = min(page_width - 2, int(max(w.right for w in column) + row_height * 0.4))
+    return (x0, x1), column
 
-    found = [(w.y, parse_time(w.text) or "", w.conf) for w in column]
 
-    # A second, whitelisted read of just this strip, the same treatment the
-    # phone column gets — digits are far more reliable with the charset pinned.
+def find_global_time(page: list[Word], rows_top: int, row_height: float) -> str:
+    """A sheet may state one time for everyone in a banner rather than in a
+    column. Anything above the data rows counts as that kind of heading."""
+    for w in sorted(page, key=lambda w: w.y):
+        if w.y < rows_top + row_height:
+            value = parse_time(w.text)
+            if value:
+                return value
+    return ""
+
+
+def find_date_column(page: list[Word], rows_top: int, rows_bottom: int,
+                     row_height: float) -> list[tuple[float, str, float]]:
+    """Some sheets carry a date per row instead of one banner for the sheet."""
+    found: list[tuple[float, str, float]] = []
+    for w in page:
+        match = NUMERIC_DATE.match(w.text.strip())
+        if not match or not (rows_top <= w.y <= rows_bottom):
+            continue
+        day, month, year = (int(v) for v in match.groups())
+        if year < 100:
+            year += 2000
+        if 1 <= day <= 31 and 1 <= month <= 12:
+            found.append((w.y, f"{year:04d}-{month:02d}-{day:02d}", w.conf))
+    return sorted(found)
+
+
+def read_time_column(source: np.ndarray, band: tuple[int, int], rows_top: int,
+                     rows_bottom: int, row_height: float,
+                     already: list[Word]) -> list[tuple[float, str, float]]:
+    """Re-read the time column with the charset pinned — the same treatment
+    that makes the phone column reliable — and merge with what the page read
+    already produced."""
+    found = [(w.y, parse_time(w.text) or "", w.conf) for w in already]
+
     scale = float(np.clip(TARGET_DIGIT_PX / max(6.0, row_height * 0.5), 1.0, 3.0))
-    crop = source[rows_top:rows_bottom, x0:x1]
+    crop = source[rows_top:rows_bottom, band[0]:band[1]]
     if crop.size:
         enlarged, applied = enlarge(remove_rules(crop), scale)
         try:
-            for w in read_words(enlarged, psm=11, lang="eng", whitelist="0123456789:."):
+            for w in read_words(enlarged, psm=11, lang="eng",
+                                whitelist="0123456789:."):
                 value = parse_time(w.text)
                 if value:
                     found.append((rows_top + w.y / applied, value, w.conf + 8))
@@ -643,31 +678,33 @@ def collect_times(source: np.ndarray, page: list[Word], rows_top: int,
 
     by_row: dict[int, tuple[float, str, float]] = {}
     for y, value, conf in found:
+        if not value:
+            continue
         key = round(y / (row_height * 0.5))
         if key not in by_row or conf > by_row[key][2]:
             by_row[key] = (y, value, conf)
     return sorted(by_row.values())
 
 
-def time_for_row(y: float, times: list[tuple[float, str, float]],
-                 row_height: float) -> str:
+def value_for_row(y: float, values: list[tuple[float, str, float]],
+                  row_height: float) -> str:
     """
-    Match a row to its time.
+    Match a row to a value that may be printed once for a merged block.
 
     A merged cell prints its value once for the whole block it spans, so an
-    exact vertical match often doesn't exist. When only one or two times were
+    exact vertical match often doesn't exist. When only one or two values were
     found the sheet is using a single merged cell for everything and the
     nearest one applies to every row. Otherwise the value carries down from the
-    nearest time at or above the row, which is how a merged block behaves.
+    nearest one at or above the row, which is how a merged block behaves.
     """
-    if not times:
+    if not values:
         return ""
-    nearest = min(times, key=lambda t: abs(t[0] - y))
+    nearest = min(values, key=lambda t: abs(t[0] - y))
     if abs(nearest[0] - y) <= row_height * 0.7:
         return nearest[1]
-    if len(times) <= 2:
+    if len(values) <= 2:
         return nearest[1]                      # one merged cell for the sheet
-    above = [t for t in times if t[0] <= y + row_height * 0.5]
+    above = [t for t in values if t[0] <= y + row_height * 0.5]
     return (above[-1] if above else nearest)[1]
 
 
@@ -836,13 +873,26 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
     names: dict[int, tuple[float, str, float]] = {}
     name_band = None
     page_words: list[Word] = []
+    time_band: tuple[int, int] | None = None
+    time_hits: list[Word] = []
 
     if time.monotonic() - started < TIME_BUDGET_SECONDS:
         t = time.monotonic()
         page, how, page_conf = read_page(source, TIME_BUDGET_SECONDS - (t - started))
         page_words = page          # unfiltered, so the date banner above the table survives
-        # only Hebrew words to the right of the phone column can be the name
-        page = [w for w in page if LETTERS.search(w.text) and w.x >= band[1] - row_height]
+
+        # Claim the time column first. If the name column is chosen first it can
+        # absorb the times when the corridor between them is narrow, and then
+        # they can never be found.
+        time_band, time_hits = find_time_column(page_words, rows_top, rows_bottom,
+                                                row_height, band[1], W)
+        info["time_band"] = list(time_band) if time_band else None
+
+        # only Hebrew words to the right of the phone column, and clear of the
+        # time column, can be the name
+        page = [w for w in page
+                if LETTERS.search(w.text) and w.x >= band[1] - row_height
+                and (time_band is None or w.x + w.width / 2 < time_band[0])]
 
         anchor = band_from_header(page, row_height, W)
         if anchor:
@@ -919,16 +969,29 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
     # The time column sits to the right of the name column on a right-to-left
     # sheet; anything left of that is a different column entirely.
     times: list[tuple[float, str, float]] = []
+    dates: list[tuple[float, str, float]] = []
+    global_time = ""
     if page_words:
         found_date = find_sheet_date(page_words, row_height)
         if found_date:
             info.update(found_date)
-        left_limit = (name_band[1] - int(row_height)) if name_band else band[1]
-        times = collect_times(source, page_words, rows_top, rows_bottom,
-                              row_height, left_limit)
+
+        # a date printed per row takes precedence over the sheet-wide banner
+        dates = find_date_column(page_words, rows_top, rows_bottom, row_height)
+
+        if time_band:
+            times = read_time_column(source, time_band, rows_top, rows_bottom,
+                                     row_height, time_hits)
+        if not times:
+            # no column — the sheet may state a single time in a heading
+            global_time = find_global_time(page_words, rows_top, row_height)
+
         info["times_found"] = len(times)
-        log.info("date %s, %d appointment times found",
-                 info.get("date", "not found"), len(times))
+        info["dates_in_rows"] = len(dates)
+        if global_time:
+            info["global_time"] = global_time
+        log.info("date %s, %d times in a column, %d dates in rows, heading time %r",
+                 info.get("date", "not found"), len(times), len(dates), global_time)
 
     # --- pair by vertical position ----------------------------------------
     name_rows = sorted(names.values())
@@ -944,9 +1007,10 @@ def extract_contacts(source: np.ndarray) -> tuple[list[Contact], dict]:
         confidence = int(round((phone_conf + name_conf) / 2)) if name else 45
         existing = contacts.get(phone)
         if existing is None or confidence > existing.confidence:
-            contacts[phone] = Contact(name=name, phone=phone,
-                                      confidence=confidence,
-                                      time=time_for_row(y, times, row_height))
+            contacts[phone] = Contact(
+                name=name, phone=phone, confidence=confidence,
+                time=value_for_row(y, times, row_height) or global_time,
+                date=value_for_row(y, dates, row_height) or info.get("date", ""))
 
     info["seconds"] = round(time.monotonic() - started, 1)
     return list(contacts.values()), info
@@ -1062,7 +1126,7 @@ async def extract(image: UploadFile = File(...)) -> dict:
         "date_text": info.get("date_text", ""),
         "contacts": [
             {"name": c.name, "phone": c.phone, "time": c.time,
-             "confidence": c.confidence}
+             "date": c.date, "confidence": c.confidence}
             for c in contacts
         ],
         "count": len(contacts),
